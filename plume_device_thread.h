@@ -18,6 +18,8 @@
 //   is queued before, and a caller that needs its backend object first (recording it in a command list) waits then; an
 //   upload buffer is mapped at memory of its own on the calling side, and unmap() queues a copy of what was written
 //   for the backend's buffer (and an execution one of each buffer left mapped), so the caller can write again at once.
+//   Not one of 16 MB or more (an image's or a texture pack's, mapped now and then): that memory would be a second copy
+//   of the buffer in the heap beside the backend's, so it maps the backend's on the device thread as other buffers do.
 // - A READBACK buffer's isMapReady() doesn't wait for the device thread: after a copy into the buffer is replayed, the
 //   device thread checks it at each replay and present until the data is there, maps it and publishes the answer,
 //   which isMapReady() reads. Its map() waits for that answer, not behind everything queued on the device thread.
