@@ -2086,6 +2086,13 @@ namespace plume {
         }
 
         if ((configuredWidth != width) || (configuredHeight != height)) {
+            // The surface's configuration sets the canvas's width and height to its own (emdawnwebgpu), which are the
+            // size asked for (plume_webgpu_hold_canvas_size()), so a size SDL asked for since resize() read it was lost:
+            // a phone turned to landscape right after going fullscreen upright kept drawing upright, stretched across
+            // the landscape canvas, since the canvas's box didn't change again. So the size asked for is put back after
+            // it, and the next present's needsResize() sees it.
+            int askedWidth = 0, askedHeight = 0;
+            emscripten_get_canvas_element_size(selector.c_str(), &askedWidth, &askedHeight);
             plume_webgpu_size_canvas(selector.c_str(), width, height);
             WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
             config.device = commandQueue->device->device;
@@ -2096,6 +2103,7 @@ namespace plume {
             config.alphaMode = WGPUCompositeAlphaMode_Opaque;
             config.presentMode = WGPUPresentMode_Fifo;
             wgpuSurfaceConfigure(surface, &config);
+            emscripten_set_canvas_element_size(selector.c_str(), askedWidth, askedHeight);
             configuredWidth = width;
             configuredHeight = height;
         }
