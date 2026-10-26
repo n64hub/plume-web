@@ -436,6 +436,7 @@ namespace plume {
 
         buffer = wgpuDeviceCreateBuffer(device->device, &bufferDesc);
         handleSerial = newHandleSerial();
+        device->liveBufferSerials.insert(handleSerial);
         if ((desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD) || (desc.heapType == RenderHeapType::READBACK)) {
             shadow.resize(bufferDesc.size, 0);
         }
@@ -447,6 +448,7 @@ namespace plume {
     }
 
     WebGPUBuffer::~WebGPUBuffer() {
+        device->liveBufferSerials.erase(handleSerial);
         if (mapped) {
             auto &mappedBuffers = device->mappedBuffers;
             mappedBuffers.erase(std::remove(mappedBuffers.begin(), mappedBuffers.end(), this), mappedBuffers.end());
@@ -909,6 +911,7 @@ namespace plume {
 
         Binding &binding = bindings[descriptorIndex];
         binding.buffer = static_cast<const WebGPUBuffer *>(buffer);
+        binding.bufferSerial = (buffer != nullptr) ? binding.buffer->handleSerial : 0;
         binding.bufferOffset = 0;
         if (bufferStructuredView != nullptr) {
             binding.bufferOffset = uint64_t(bufferStructuredView->firstElement) * bufferStructuredView->structureByteStride;
@@ -976,6 +979,21 @@ namespace plume {
             case RenderDescriptorRangeType::READ_WRITE_STRUCTURED_BUFFER:
             case RenderDescriptorRangeType::READ_WRITE_BYTE_ADDRESS_BUFFER: {
                 if (binding.buffer == nullptr) {
+                    continue;
+                }
+
+                // A set keeps pointing at a buffer the caller destroyed until it binds another there, and reading the
+                // destroyed one's handle would throw on the device thread and stop it for good. So the binding is left
+                // out, as an unset one is (a shader that reads it fails validation), and said, the first few times.
+                if (device->liveBufferSerials.count(binding.bufferSerial) == 0) {
+                    if (device->destroyedBufferBindings++ < 8) {
+                        std::string setBindings;
+                        for (const Binding &other : bindings) {
+                            setBindings += " " + std::to_string(other.binding);
+                        }
+                        fprintf(stderr, "plume WebGPU: a descriptor set binds a destroyed buffer at binding %u (its bindings:%s), left out\n", binding.binding, setBindings.c_str());
+                    }
+
                     continue;
                 }
 

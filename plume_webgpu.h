@@ -131,6 +131,7 @@
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <webgpu/webgpu.h>
 
@@ -241,6 +242,7 @@ namespace plume {
             RenderDescriptorRangeType type = RenderDescriptorRangeType::UNKNOWN;
             uint32_t binding = 0;
             const WebGPUBuffer *buffer = nullptr;
+            uint64_t bufferSerial = 0;
             uint64_t bufferOffset = 0;
             uint64_t bufferSize = 0;
             const WebGPUTexture *texture = nullptr;
@@ -658,6 +660,11 @@ namespace plume {
         bool depth32FloatStencil8 = false;
         WGPUBindGroupLayout emptyLayout = nullptr;
         WGPUBindGroup emptyBindGroup = nullptr;
+        // The handleSerial of every buffer not destroyed yet, so a descriptor set can tell a buffer it still binds
+        // was destroyed since (WebGPUDescriptorSet::update()), and how many times one was. Buffers are made, destroyed
+        // and bound on the device's one thread (plume_device_thread.h), so neither takes a lock.
+        std::unordered_set<uint64_t> liveBufferSerials;
+        uint32_t destroyedBufferBindings = 0;
         WGPUBindGroupLayoutEntry pushConstantsEntry = {};
         WGPUBindGroupLayout pushConstantsLayout = nullptr;
         std::unordered_map<std::string, WGPUBindGroupLayout> bindGroupLayouts;
