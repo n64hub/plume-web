@@ -755,6 +755,7 @@ namespace plume {
         RenderCommandList *inner = nullptr;
         std::shared_ptr<Recording> recording;
         std::shared_ptr<const Recording> recorded;
+        std::vector<std::shared_ptr<Recording>> spares;
         std::vector<std::shared_ptr<DTMapState>> readbacks;
         std::vector<std::shared_ptr<DTMapState>> recordedReadbacks;
         uint64_t openSerial = 0;
@@ -810,7 +811,24 @@ namespace plume {
 
         void begin() override {
             setCommandListOpen(openSerial, false);
-            recording = std::make_shared<Recording>();
+
+            // A recording the device thread is done with is cleared and recorded into again here, so its commands are
+            // freed on this thread and its storage kept: a new one each time was freed on the page's thread after its
+            // replay, thousands of commands a frame in a frame drawn in many workloads.
+            recording.reset();
+            for (const std::shared_ptr<Recording> &spare : spares) {
+                if (spare.use_count() == 1) {
+                    recording = spare;
+                    recording->clear();
+                    break;
+                }
+            }
+
+            if (recording == nullptr) {
+                recording = std::make_shared<Recording>();
+                spares.emplace_back(recording);
+            }
+
             readbacks.clear();
             computeLayout = nullptr;
             graphicsLayout = nullptr;
