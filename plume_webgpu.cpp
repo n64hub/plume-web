@@ -444,6 +444,7 @@ namespace plume {
         }
 
         buffer = wgpuDeviceCreateBuffer(device->device, &bufferDesc);
+        size = bufferDesc.size;
         handleSerial = newHandleSerial();
         device->liveBufferSerials.insert(handleSerial);
         if ((desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD) || (desc.heapType == RenderHeapType::READBACK)) {
@@ -969,8 +970,13 @@ namespace plume {
 
         layoutEntries.clear();
         groupEntries.clear();
-        std::string key;
-        std::string entriesKey;
+
+        // Built in the same strings every time, on the device thread: an RT64 frame drawn in many workloads rebuilds
+        // its texture sets for each of them, and new strings grown to a key's length took most of this.
+        static thread_local std::string key;
+        static thread_local std::string entriesKey;
+        key.clear();
+        entriesKey.clear();
         for (const Binding &binding : bindings) {
             WGPUBindGroupLayoutEntry layoutEntry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
             WGPUBindGroupEntry groupEntry = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -1025,7 +1031,7 @@ namespace plume {
                     // A storage binding is a multiple of 4 bytes long, and a uniform one of 16. Buffers are made that
                     // way, so the padding is there.
                     const uint64_t sizeAlignment = (layoutEntry.buffer.type == WGPUBufferBindingType_Uniform) ? 16 : 4;
-                    groupEntry.size = std::min<uint64_t>(alignUp(groupEntry.size, sizeAlignment), wgpuBufferGetSize(groupEntry.buffer) - groupEntry.offset);
+                    groupEntry.size = std::min<uint64_t>(alignUp(groupEntry.size, sizeAlignment), binding.buffer->size - groupEntry.offset);
                 }
 
                 appendKey(key, 'b', uint32_t(binding.binding), int32_t(layoutEntry.buffer.type), int32_t(0), int32_t(0));
@@ -1160,7 +1166,9 @@ namespace plume {
             entry.buffer = buffer;
             entry.size = bindingSize;
             entries.emplace_back(entry);
-            const std::string key = groupKey + "pushConstants:" + std::to_string(chunkId) + ":" + std::to_string(bindingSize);
+            static thread_local std::string key;
+            key.assign(groupKey);
+            appendKey(key, 'c', uint64_t(chunkId), uint32_t(bindingSize));
             group = device->getBindGroup(key, getLayoutWithPushConstants(), entries);
         }
 
@@ -2320,7 +2328,8 @@ namespace plume {
         }
 
         const bool pushConstants = state.layout->pushConstantsSize > 0;
-        std::vector<WGPUBindGroupLayout> layouts;
+        static thread_local std::vector<WGPUBindGroupLayout> layouts;
+        layouts.clear();
         for (uint32_t i = 0; i < state.layout->descriptorSetCount; i++) {
             WebGPUDescriptorSet *descriptorSet = state.descriptorSets[i];
             const bool sharesPushConstants = pushConstants && (i == PushConstantsGroup);
@@ -2911,7 +2920,7 @@ namespace plume {
         const uint64_t srcOffset = srcBuffer.offset - before;
         const uint64_t dstOffset = dstBuffer.offset - before;
         uint64_t wordSize = alignUp(size + before, 4);
-        wordSize = std::min({ wordSize, wgpuBufferGetSize(src->buffer) - srcOffset, wgpuBufferGetSize(dst->buffer) - dstOffset });
+        wordSize = std::min({ wordSize, src->size - srcOffset, dst->size - dstOffset });
         assert((((srcOffset | dstOffset | wordSize) & 3) == 0) && "Both ends of a buffer copy must be equally misaligned.");
         wgpuCommandEncoderCopyBufferToBuffer(encoder, src->buffer, srcOffset, dst->buffer, dstOffset, wordSize);
         copiedInto(dst);

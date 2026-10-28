@@ -171,6 +171,7 @@ namespace plume {
 
     struct WebGPUBuffer : RenderBuffer {
         WGPUBuffer buffer = nullptr;
+        uint64_t size = 0;
         uint64_t handleSerial = 0;
         WebGPUDevice *device = nullptr;
         RenderBufferDesc desc;
