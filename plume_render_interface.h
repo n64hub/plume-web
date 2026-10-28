@@ -288,6 +288,10 @@ namespace plume {
         // A backend that delivers a READBACK buffer's data asynchronously (WebGPU's) calls this back each time some
         // arrives, on the thread it delivers it on, so a thread waiting for isMapReady() can be answered then.
         virtual void setReadbackCallback(void (*callback)()) { }
+
+        // Whether the device was lost and the interface's createDevice() now makes a new one to carry on with: a
+        // WebGPU device once the page has another in its place (plume_webgpu_device.js). Any thread may ask.
+        virtual bool isLost() const { return false; }
 #endif
     };
 

@@ -6,10 +6,15 @@
 // by default, where D3D12 and most adapters allow 16384). Validation errors and a lost device are logged to the
 // console. The adapter's info (vendor, architecture) is kept as Module.plumeWebGPUAdapterInfo. At the end,
 // setBindGroup is made to work in Firefox with a heap past 2 GB.
-Module['preRun'] = [].concat(Module['preRun'] || []);
-Module['preRun'].push(() => {
-  addRunDependency('plume-webgpu-device');
-  (async () => {
+//
+// A device is lost to a driver update or reset, the browser's GPU process crashing or a laptop switching GPUs. Then a
+// new one is asked for the same way and put in the old one's place, emscripten_webgpu_get_device() returning it from
+// then on, and the old one's plumeReplaced promise resolves: plume's device made on it says isLost(), and the
+// application makes everything again on a new one. A device lost within 10 s of being made isn't replaced, since
+// another would likely go the same way, nor one whose replacement couldn't be had: then the page's
+// Module.plumeWebGPUDeviceLostForGood(info), if it has one, tells the player (plumeReplaced never settles).
+(() => {
+  const requestDevice = async () => {
     if (!navigator.gpu) {
       throw new Error('This browser has no WebGPU (navigator.gpu is missing; the page must be a secure context).');
     }
@@ -33,16 +38,46 @@ Module['preRun'].push(() => {
     }
 
     const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
+    const madeAt = performance.now();
     device.addEventListener('uncapturederror', (event) => console.error('WebGPU error: ' + event.error.message));
-    device.lost.then((info) => console.error('WebGPU device lost: ' + info.message));
-    Module['preinitializedWebGPUDevice'] = device;
-    Module['plumeWebGPUAdapterInfo'] = adapter.info;
-    removeRunDependency('plume-webgpu-device');
-  })().catch((error) => {
-    console.error(error);
-    abort(error);
+    device.plumeReplaced = device.lost.then(async (info) => {
+      console.error('WebGPU device lost: ' + info.message);
+      try {
+        if (performance.now() - madeAt < 10000) {
+          throw new Error('plume: the WebGPU device was lost ' + ((performance.now() - madeAt) / 1000).toFixed(1) + ' s after it was made, so it is not replaced');
+        }
+
+        const replacement = await requestDevice();
+        Module['preinitializedWebGPUDevice'] = replacement.device;
+        Module['plumeWebGPUAdapterInfo'] = replacement.adapter.info;
+        // emscripten_webgpu_get_device() imports the device once and keeps it; this has it import the new one.
+        WebGPU.preinitializedDeviceId = undefined;
+        console.log('plume: a new WebGPU device in place of the lost one');
+      } catch (error) {
+        console.error(String(error));
+        if (Module['plumeWebGPUDeviceLostForGood']) {
+          Module['plumeWebGPUDeviceLostForGood'](info);
+        }
+        await new Promise(() => {});
+      }
+    });
+
+    return { adapter, device };
+  };
+
+  Module['preRun'] = [].concat(Module['preRun'] || []);
+  Module['preRun'].push(() => {
+    addRunDependency('plume-webgpu-device');
+    requestDevice().then(({ adapter, device }) => {
+      Module['preinitializedWebGPUDevice'] = device;
+      Module['plumeWebGPUAdapterInfo'] = adapter.info;
+      removeRunDependency('plume-webgpu-device');
+    }).catch((error) => {
+      console.error(error);
+      abort(error);
+    });
   });
-});
+})();
 
 // emdawnwebgpu hands setBindGroup its dynamic offsets as the whole wasm heap (HEAPU32) with a start and a length.
 // Firefox refuses any ArrayBuffer or view larger than 2 GB as an argument, so on a page whose heap has grown past that

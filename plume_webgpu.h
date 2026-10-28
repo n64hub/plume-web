@@ -118,6 +118,9 @@
 // plume_webgpu_device.js), because requesting one is asynchronous. Emdawnwebgpu marks emscripten_webgpu_get_device(),
 // which returns it, as deprecated; the replacement, requesting the adapter and device here and waiting with
 // wgpuInstanceWaitAny(), needs ASYNCIFY or JSPI. RenderWindow is the CSS selector of the canvas, such as "#canvas".
+// When that device is lost, plume_webgpu_device.js asks for another and puts it in its place, and the device made on
+// the lost one says isLost() from then on: the application destroys everything it made and starts again with a new
+// device from createDevice(), as RT64 does (Application::replaceLostDevice()).
 //
 // The examples build for the browser with emcmake and -DPLUME_BUILD_EXAMPLES=ON, given PLUME_DXC_EXECUTABLE (a dxc
 // for the host) and naga-cli on the PATH or as PLUME_NAGA_EXECUTABLE; see examples/cmake/modules/PlumeWGSL.cmake.
@@ -679,6 +682,9 @@ namespace plume {
         std::map<std::pair<std::string, WGPUPipelineLayout>, WebGPUSharedShaderBuilds> sharedShaderBuilds;
         double lastPollTime = 0.0;
         bool workDoneAfterSubmit = false;
+        // Set from the page's main thread once the device is lost and another is in its place (isLost()). Never freed:
+        // the page may set it after the device is gone.
+        std::atomic<int32_t> *lost = nullptr;
 
         WebGPUDevice(WebGPUInterface *renderInterface);
         ~WebGPUDevice() override;
@@ -707,6 +713,7 @@ namespace plume {
         bool beginCapture() override;
         bool endCapture() override;
         void setReadbackCallback(void (*callback)()) override;
+        bool isLost() const override;
         WGPUBindGroupLayout getBindGroupLayout(const std::string &key, const std::vector<WGPUBindGroupLayoutEntry> &entries);
         WGPUBindGroup getBindGroup(const std::string &key, WGPUBindGroupLayout layout, const std::vector<WGPUBindGroupEntry> &entries);
         WGPUPipelineLayout getPipelineLayout(const std::vector<WGPUBindGroupLayout> &layouts);

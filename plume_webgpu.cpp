@@ -82,6 +82,15 @@ EM_JS(void, plume_webgpu_hold_canvas_size, (const char *selector), {
     }
 });
 
+// Sets *flag once the page's device, which emscripten_webgpu_get_device() returns, is lost and plume_webgpu_device.js has
+// put another in its place (its plumeReplaced, a promise that never settles if no new device comes).
+EM_JS(void, plume_webgpu_watch_device, (int32_t *flag), {
+    const device = Module['preinitializedWebGPUDevice'];
+    if (device && device.plumeReplaced) {
+        device.plumeReplaced.then(() => Atomics.store(HEAP32, flag >> 2, 1));
+    }
+});
+
 EM_JS(void, plume_webgpu_size_canvas, (const char *selector, uint32_t width, uint32_t height), {
     const canvas = document.querySelector(UTF8ToString(selector));
     if (canvas) {
@@ -3158,6 +3167,9 @@ namespace plume {
             return;
         }
 
+        lost = new std::atomic<int32_t>(0);
+        plume_webgpu_watch_device(reinterpret_cast<int32_t *>(lost));
+
         queue = wgpuDeviceGetQueue(device);
         float32Filterable = wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Filterable);
         float32Blendable = wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Blendable);
@@ -3518,6 +3530,10 @@ namespace plume {
 
     void WebGPUDevice::setReadbackCallback(void (*callback)()) {
         readbackCallback = callback;
+    }
+
+    bool WebGPUDevice::isLost() const {
+        return (lost != nullptr) && (lost->load() != 0);
     }
 
     // WebGPUInterface

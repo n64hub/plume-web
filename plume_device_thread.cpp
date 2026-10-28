@@ -1585,6 +1585,13 @@ namespace plume {
             return runSync(thread, [&]() { return inner->getSampleCountsSupported(format); });
         }
 
+#if defined(__EMSCRIPTEN__)
+        // The backend answers from any thread (RenderDevice::isLost()), so this doesn't wait for the device thread.
+        bool isLost() const override {
+            return inner->isLost();
+        }
+#endif
+
         bool beginCapture() override {
             return runSync(thread, [&]() { return inner->beginCapture(); });
         }
