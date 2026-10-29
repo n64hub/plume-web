@@ -175,7 +175,12 @@ namespace plume {
         uint64_t handleSerial = 0;
         WebGPUDevice *device = nullptr;
         RenderBufferDesc desc;
-        std::vector<uint8_t> shadow;
+        // What map() hands out. A READBACK buffer's, all its life, holds what its last map brought back. An UPLOAD
+        // buffer's is made at map() and freed at unmap(), once what was written is out (writeBuffer copies it): kept,
+        // it was a second copy of the buffer in the heap beside the GPU's, and RT64 keeps the buffers of its 64
+        // workloads at the size of the largest draws each has had. So an UPLOAD buffer's contents at map() are
+        // undefined, as a fresh one's are on any backend, and a caller writes all it unmaps.
+        std::unique_ptr<uint8_t[]> shadow;
         std::shared_ptr<WebGPUReadback> readback;
         bool mapped = false;
 

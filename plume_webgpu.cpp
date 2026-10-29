@@ -447,11 +447,8 @@ namespace plume {
         size = bufferDesc.size;
         handleSerial = newHandleSerial();
         device->liveBufferSerials.insert(handleSerial);
-        if ((desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD) || (desc.heapType == RenderHeapType::READBACK)) {
-            shadow.resize(bufferDesc.size, 0);
-        }
-
         if (desc.heapType == RenderHeapType::READBACK) {
+            shadow.reset(new uint8_t[size]());
             readback = std::make_shared<WebGPUReadback>();
             readback->buffer = this;
         }
@@ -475,20 +472,20 @@ namespace plume {
     }
 
     void *WebGPUBuffer::map(uint32_t subresource, const RenderRange *readRange) {
-        if (shadow.empty()) {
-            assert(false && "Only UPLOAD and READBACK buffers can be mapped.");
-            return nullptr;
-        }
-
         if (desc.heapType == RenderHeapType::READBACK) {
             waitForReadback();
         }
+        else if ((desc.heapType != RenderHeapType::UPLOAD) && (desc.heapType != RenderHeapType::GPU_UPLOAD)) {
+            assert(false && "Only UPLOAD and READBACK buffers can be mapped.");
+            return nullptr;
+        }
         else if (!mapped) {
+            shadow.reset(new uint8_t[size]);
             device->mappedBuffers.emplace_back(this);
         }
 
         mapped = true;
-        return shadow.data();
+        return shadow.get();
     }
 
     void WebGPUBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
@@ -507,16 +504,18 @@ namespace plume {
             flush(writtenRange->begin, writtenRange->end);
         }
         else {
-            flush(0, shadow.size());
+            flush(0, size);
         }
+
+        shadow.reset();
     }
 
     void WebGPUBuffer::flush(uint64_t begin, uint64_t end) {
         // writeBuffer wants a multiple of 4 bytes at a multiple of 4.
         begin = begin & ~uint64_t(3);
-        end = std::min<uint64_t>(alignUp(end, 4), shadow.size());
+        end = std::min<uint64_t>(alignUp(end, 4), size);
         if (end > begin) {
-            wgpuQueueWriteBuffer(device->queue, buffer, begin, shadow.data() + begin, end - begin);
+            wgpuQueueWriteBuffer(device->queue, buffer, begin, shadow.get() + begin, end - begin);
         }
     }
 
@@ -537,9 +536,9 @@ namespace plume {
         readback->pending = false;
         WebGPUBuffer *buffer = readback->buffer;
         if ((status == WGPUMapAsyncStatus_Success) && (buffer != nullptr)) {
-            const void *data = wgpuBufferGetConstMappedRange(buffer->buffer, 0, buffer->shadow.size());
+            const void *data = wgpuBufferGetConstMappedRange(buffer->buffer, 0, buffer->size);
             if (data != nullptr) {
-                memcpy(buffer->shadow.data(), data, buffer->shadow.size());
+                memcpy(buffer->shadow.get(), data, buffer->size);
             }
 
             wgpuBufferUnmap(buffer->buffer);
@@ -561,7 +560,7 @@ namespace plume {
         callbackInfo.callback = readbackMapped;
         callbackInfo.userdata1 = new std::shared_ptr<WebGPUReadback>(readback);
         callbackInfo.userdata2 = reinterpret_cast<void *>(uintptr_t(readback->serial));
-        wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, shadow.size(), callbackInfo);
+        wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, size, callbackInfo);
     }
 
     // Waits for the map in flight, if the build can wait. Called before reading the buffer and before a submission
@@ -3319,7 +3318,7 @@ namespace plume {
 
     void WebGPUDevice::flushMappedBuffers() {
         for (WebGPUBuffer *buffer : mappedBuffers) {
-            buffer->flush(0, buffer->shadow.size());
+            buffer->flush(0, buffer->size);
         }
     }
 

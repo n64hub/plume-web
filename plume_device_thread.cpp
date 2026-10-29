@@ -280,10 +280,10 @@ namespace plume {
         bool uploadHeap = false;
         uint64_t size = 0;
 
-        // An upload buffer's memory on the calling side (map()), for one smaller than CopiedUploadMaxSize.
+        // An upload buffer's memory on the calling side while it's mapped (map()), handed to the device thread by unmap(),
+        // for one smaller than CopiedUploadMaxSize.
         static constexpr uint64_t CopiedUploadMaxSize = 16 * 1024 * 1024;
-        std::unique_ptr<uint8_t[]> uploadCopy;
-        std::once_flag uploadCopyMade;
+        std::shared_ptr<uint8_t[]> uploadCopy;
 
         DTBuffer(DeviceThread *thread, std::unique_ptr<RenderBuffer> inner, const RenderBufferDesc &desc) : thread(thread), inner(inner.release()), size(desc.size) {
             uploadHeap = (desc.heapType == RenderHeapType::UPLOAD) || (desc.heapType == RenderHeapType::GPU_UPLOAD);
@@ -338,17 +338,26 @@ namespace plume {
                 }
             }
 
-            // An upload buffer is mapped at memory of its own on the calling side, the same every time, without waiting
-            // for the device thread (RT64 maps ~30 a frame, 1,700 a second in Pilotwings 64's menus, and each map that
-            // waited was 0.1-0.2 ms behind the page's thread). unmap() copies what was written and queues the copy for
-            // the backend's buffer, so the caller can write the next data at once, before the device thread has got to
-            // the last: waitForCommandFence() doesn't wait for it. Not one of CopiedUploadMaxSize or more: that memory is a
-            // second copy of the buffer in the heap beside the backend's, and RecompFrontend's for its images (1.5 times
-            // the largest yet, an SVG drawn at 4K among them) took GoldenEye's page past its heap at boot. One that big
-            // is mapped now and then, so it maps the backend's on the device thread below, which runs every unmap queued
-            // before, and unmap() is queued: the caller writes into the backend's memory once the last data went out.
+            // An upload buffer is mapped at memory of its own on the calling side, without waiting for the device thread
+            // (RT64 maps ~30 a frame, 1,700 a second in Pilotwings 64's menus, and each map that waited was 0.1-0.2 ms
+            // behind the page's thread). unmap() hands that memory to the device thread, which writes what was written
+            // into the backend's buffer, so the caller can write the next data at once, before the device thread has got
+            // to the last: waitForCommandFence() doesn't wait for it. The memory is made at each map and freed once the
+            // device thread has written it out. Kept, it was a copy of every upload buffer in the heap beside the
+            // backend's, and those add up: RT64's 64 workloads each keep their buffers at the size of the largest draws
+            // they have had (Rush 2049's page ran out of its heap in a race). So, as the backend's (plume_webgpu.h,
+            // WebGPUBuffer::shadow), what it holds at map() is undefined, and a caller writes all it unmaps. Not one of
+            // CopiedUploadMaxSize or more: its memory here and the backend's at unmap() would be two of it in the heap at
+            // once, and the heap's break, which never comes down, keeps the peak (RecompFrontend's buffer for its images,
+            // 1.5 times the largest yet, an SVG drawn at 4K among them, took GoldenEye's page past its heap at boot). One
+            // that big is mapped now and then, so it maps the backend's on the device thread below, which runs every unmap
+            // queued before, and unmap() is queued: the caller writes into the backend's memory once the last data went
+            // out.
             if (uploadHeap && (subresource == 0) && (size < CopiedUploadMaxSize)) {
-                std::call_once(uploadCopyMade, [&]() { uploadCopy.reset(new uint8_t[size]()); });
+                if (uploadCopy == nullptr) {
+                    uploadCopy.reset(new uint8_t[size]);
+                }
+
                 setUploadMapped(this, true);
                 return uploadCopy.get();
             }
@@ -394,9 +403,9 @@ namespace plume {
                 setUploadMapped(this, false);
                 const uint64_t begin = ranged ? std::min(range.begin, size) : 0;
                 const uint64_t end = ranged ? std::min(std::max(range.end, begin), size) : size;
-                thread->runAsync([buffer, begin, bytes = std::vector<uint8_t>(uploadCopy.get() + begin, uploadCopy.get() + end), ranged, range]() {
+                thread->runAsync([buffer, begin, end, written = std::move(uploadCopy), ranged, range]() {
                     uint8_t *data = static_cast<uint8_t *>(buffer->map(0, nullptr));
-                    memcpy(data + begin, bytes.data(), bytes.size());
+                    memcpy(data + begin, written.get() + begin, end - begin);
                     buffer->unmap(0, ranged ? &range : nullptr);
                 });
             }
