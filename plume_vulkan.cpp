@@ -3076,13 +3076,26 @@ namespace plume {
         }
     }
 
+    // A rect clamped to a target's size. Vulkan wants a scissor's offset at 0 or more and a clear's rect inside the render
+    // area, and RT64 asks for both past a target's edges (an extended scissor in a wide window starts left of 0): a GPU
+    // clips them, but Mesa's lavapipe draws into memory of its own and wrote past the image, into the heap.
+    static VkRect2D clampedRect(const RenderRect &rect, uint32_t width, uint32_t height) {
+        const int32_t left = std::max(rect.left, 0);
+        const int32_t top = std::max(rect.top, 0);
+        const int32_t right = std::min(rect.right, int32_t(width));
+        const int32_t bottom = std::min(rect.bottom, int32_t(height));
+        return VkRect2D{ VkOffset2D{ left, top }, VkExtent2D{ uint32_t(std::max(right - left, 0)), uint32_t(std::max(bottom - top, 0)) } };
+    }
+
     void VulkanCommandList::setScissors(const RenderRect *scissorRects, uint32_t count) {
+        const uint32_t width = (targetFramebuffer != nullptr) ? targetFramebuffer->getWidth() : UINT32_MAX / 2;
+        const uint32_t height = (targetFramebuffer != nullptr) ? targetFramebuffer->getHeight() : UINT32_MAX / 2;
         if (count > 1) {
             thread_local std::vector<VkRect2D> scissorVector;
             scissorVector.clear();
 
             for (uint32_t i = 0; i < count; i++) {
-                scissorVector.emplace_back(VkRect2D{ VkOffset2D{ scissorRects[i].left, scissorRects[i].top }, VkExtent2D{ uint32_t(scissorRects[i].right - scissorRects[i].left), uint32_t(scissorRects[i].bottom - scissorRects[i].top) } });
+                scissorVector.emplace_back(clampedRect(scissorRects[i], width, height));
             }
 
             if (!scissorVector.empty()) {
@@ -3091,7 +3104,7 @@ namespace plume {
         }
         else {
             // Single element fast path.
-            VkRect2D scissor = VkRect2D{ VkOffset2D{ scissorRects[0].left, scissorRects[0].top }, VkExtent2D{ uint32_t(scissorRects[0].right - scissorRects[0].left), uint32_t(scissorRects[0].bottom - scissorRects[0].top) } };
+            VkRect2D scissor = clampedRect(scissorRects[0], width, height);
             vkCmdSetScissor(vk, 0, 1, &scissor);
         }
     }
@@ -3118,10 +3131,10 @@ namespace plume {
         if (clearRectsCount > 0) {
             for (uint32_t i = 0; i < clearRectsCount; i++) {
                 VkClearRect clearRect;
-                clearRect.rect.offset.x = clearRects[i].left;
-                clearRect.rect.offset.y = clearRects[i].top;
-                clearRect.rect.extent.width = clearRects[i].right - clearRects[i].left;
-                clearRect.rect.extent.height = clearRects[i].bottom - clearRects[i].top;
+                clearRect.rect = clampedRect(clearRects[i], width, height);
+                if ((clearRect.rect.extent.width == 0) || (clearRect.rect.extent.height == 0)) {
+                    continue;
+                }
                 clearRect.baseArrayLayer = 0;
                 clearRect.layerCount = 1;
                 rectVector.emplace_back(clearRect);
@@ -3157,7 +3170,9 @@ namespace plume {
         rgba[3] = colorValue.a;
         attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         attachment.colorAttachment = attachmentIndex;
-        vkCmdClearAttachments(vk, 1, &attachment, uint32_t(rectVector.size()), rectVector.data());
+        if (!rectVector.empty()) {
+            vkCmdClearAttachments(vk, 1, &attachment, uint32_t(rectVector.size()), rectVector.data());
+        }
     }
 
     void VulkanCommandList::clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
@@ -3180,7 +3195,9 @@ namespace plume {
             attachment.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
         }
 
-        vkCmdClearAttachments(vk, 1, &attachment, uint32_t(rectVector.size()), rectVector.data());
+        if (!rectVector.empty()) {
+            vkCmdClearAttachments(vk, 1, &attachment, uint32_t(rectVector.size()), rectVector.data());
+        }
     }
 
     void VulkanCommandList::copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) {
