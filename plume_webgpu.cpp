@@ -841,6 +841,7 @@ namespace plume {
             stage |= WGPUShaderStage_Compute;
         }
 
+        const uint64_t stagesRevision = device->bindingStagesRevision;
         numbersAfter("@binding(", [&](uint32_t binding) {
             WGPUShaderStage &stages = device->bindingStages[binding];
             if ((stages & stage) != stage) {
@@ -848,6 +849,42 @@ namespace plume {
                 device->bindingStagesRevision++;
             }
         });
+
+        // A new binding stage changes the layouts the compute pipelines built in the background will be dispatched with.
+        if (device->bindingStagesRevision != stagesRevision) {
+            for (WebGPUComputePipeline *pipeline : device->computePipelines) {
+                pipeline->buildPredicted();
+            }
+        }
+
+        // A compute shader's binding types, which its pipeline predicts its layout from (WebGPUComputePipeline):
+        // `@group(g) @binding(b) var<...> name: type;` gives (g, b) its type, without spaces.
+        if (stage == WGPUShaderStage_Compute) {
+            for (size_t i = source.find("@group("); i != std::string::npos; i = source.find("@group(", i + 1)) {
+                const size_t end = source.find(';', i);
+                const size_t bindingAt = source.find("@binding(", i);
+                const size_t varAt = source.find("var", i);
+                if ((end == std::string::npos) || (bindingAt > end) || (varAt > end)) {
+                    continue;
+                }
+
+                const size_t colon = source.find(':', varAt);
+                if (colon > end) {
+                    continue;
+                }
+
+                std::string type;
+                for (size_t j = colon + 1; j < end; j++) {
+                    if (!isspace((unsigned char)(source[j]))) {
+                        type += source[j];
+                    }
+                }
+
+                const uint32_t group = uint32_t(strtoul(source.c_str() + i + strlen("@group("), nullptr, 10));
+                const uint32_t binding = uint32_t(strtoul(source.c_str() + bindingAt + strlen("@binding("), nullptr, 10));
+                bindingTypes[{ group, binding }] = type;
+            }
+        }
     }
 
     WebGPUShader::~WebGPUShader() {
@@ -958,6 +995,89 @@ namespace plume {
         (key.append(reinterpret_cast<const char *>(&values), sizeof(values)), ...);
     }
 
+    // A binding's layout entry, with its part of the set layout's key: from what is bound there (WebGPUDescriptorSet::
+    // update()), or from what a compute shader declares there (WebGPUComputePipeline's predicted layout). A texture's
+    // follows its format, view dimension and samples, a sampler's its desc.
+    static WGPUBindGroupLayoutEntry layoutEntryFor(const WebGPUDevice *device, RenderDescriptorRangeType type, uint32_t binding, RenderFormat format, WGPUTextureViewDimension dimension, bool multisampled, const RenderSamplerDesc *samplerDesc, std::string &key) {
+        WGPUBindGroupLayoutEntry layoutEntry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+        layoutEntry.binding = binding;
+        auto stagesIt = device->bindingStages.find(binding);
+        layoutEntry.visibility = (stagesIt != device->bindingStages.end()) ? stagesIt->second : WGPUShaderStage_None;
+        switch (type) {
+        case RenderDescriptorRangeType::CONSTANT_BUFFER:
+        case RenderDescriptorRangeType::FORMATTED_BUFFER:
+        case RenderDescriptorRangeType::STRUCTURED_BUFFER:
+        case RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER:
+        case RenderDescriptorRangeType::READ_WRITE_FORMATTED_BUFFER:
+        case RenderDescriptorRangeType::READ_WRITE_STRUCTURED_BUFFER:
+        case RenderDescriptorRangeType::READ_WRITE_BYTE_ADDRESS_BUFFER:
+            if (type == RenderDescriptorRangeType::CONSTANT_BUFFER) {
+                layoutEntry.buffer.type = WGPUBufferBindingType_Uniform;
+            }
+            else if ((type == RenderDescriptorRangeType::FORMATTED_BUFFER) || (type == RenderDescriptorRangeType::STRUCTURED_BUFFER) || (type == RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER)) {
+                layoutEntry.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+            }
+            else {
+                // Writable storage isn't allowed in vertex shaders.
+                layoutEntry.buffer.type = WGPUBufferBindingType_Storage;
+                layoutEntry.visibility &= ~WGPUShaderStage_Vertex;
+            }
+
+            appendKey(key, 'b', uint32_t(binding), int32_t(layoutEntry.buffer.type), int32_t(0), int32_t(0));
+            break;
+        case RenderDescriptorRangeType::READ_WRITE_TEXTURE: {
+            // Core WebGPU reads and writes one storage texture only in r32float, r32uint and r32sint, so any other
+            // format is write-only, as PlumeWGSL.cmake declares it in the shader too.
+            const bool readWrite = (format == RenderFormat::R32_FLOAT) || (format == RenderFormat::R32_UINT) || (format == RenderFormat::R32_SINT);
+            layoutEntry.storageTexture.access = readWrite ? WGPUStorageTextureAccess_ReadWrite : WGPUStorageTextureAccess_WriteOnly;
+            layoutEntry.storageTexture.format = toWGPU(format);
+            layoutEntry.storageTexture.viewDimension = dimension;
+            layoutEntry.visibility &= ~WGPUShaderStage_Vertex;
+            appendKey(key, 's', uint32_t(binding), int32_t(layoutEntry.storageTexture.format), int32_t(dimension), int32_t(0));
+            break;
+        }
+        case RenderDescriptorRangeType::TEXTURE: {
+            bool isSigned = false;
+            if (RenderFormatIsDepth(format)) {
+                layoutEntry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+            }
+            else if (isIntegerFormat(format, isSigned)) {
+                layoutEntry.texture.sampleType = isSigned ? WGPUTextureSampleType_Sint : WGPUTextureSampleType_Uint;
+            }
+            else if (multisampled || (isFloat32Format(format) && !device->float32Filterable)) {
+                layoutEntry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+            }
+            else {
+                layoutEntry.texture.sampleType = WGPUTextureSampleType_Float;
+            }
+
+            layoutEntry.texture.viewDimension = dimension;
+            layoutEntry.texture.multisampled = multisampled;
+            appendKey(key, 't', uint32_t(binding), int32_t(layoutEntry.texture.sampleType), int32_t(dimension), int32_t(multisampled));
+            break;
+        }
+        case RenderDescriptorRangeType::SAMPLER:
+            if (samplerDesc->comparisonEnabled) {
+                layoutEntry.sampler.type = WGPUSamplerBindingType_Comparison;
+            }
+            else if ((samplerDesc->minFilter == RenderFilter::LINEAR) || (samplerDesc->magFilter == RenderFilter::LINEAR) || (samplerDesc->mipmapMode == RenderMipmapMode::LINEAR)) {
+                layoutEntry.sampler.type = WGPUSamplerBindingType_Filtering;
+            }
+            else {
+                layoutEntry.sampler.type = WGPUSamplerBindingType_NonFiltering;
+            }
+
+            appendKey(key, 'p', uint32_t(binding), int32_t(layoutEntry.sampler.type), int32_t(0), int32_t(0));
+            break;
+        default:
+            assert(false && "Unsupported descriptor type.");
+            break;
+        }
+
+        appendKey(key, 'v', uint64_t(layoutEntry.visibility));
+        return layoutEntry;
+    }
+
     // Builds the bind group layout from what is bound, and the bind group for it. Unset descriptors are left out of
     // both, so a shader that reads one fails pipeline validation instead of reading garbage.
     void WebGPUDescriptorSet::update() {
@@ -977,11 +1097,8 @@ namespace plume {
         key.clear();
         entriesKey.clear();
         for (const Binding &binding : bindings) {
-            WGPUBindGroupLayoutEntry layoutEntry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+            WGPUBindGroupLayoutEntry layoutEntry;
             WGPUBindGroupEntry groupEntry = WGPU_BIND_GROUP_ENTRY_INIT;
-            layoutEntry.binding = binding.binding;
-            auto stagesIt = device->bindingStages.find(binding.binding);
-            layoutEntry.visibility = (stagesIt != device->bindingStages.end()) ? stagesIt->second : WGPUShaderStage_None;
             groupEntry.binding = binding.binding;
 
             switch (binding.type) {
@@ -1011,18 +1128,7 @@ namespace plume {
                     continue;
                 }
 
-                if (binding.type == RenderDescriptorRangeType::CONSTANT_BUFFER) {
-                    layoutEntry.buffer.type = WGPUBufferBindingType_Uniform;
-                }
-                else if ((binding.type == RenderDescriptorRangeType::FORMATTED_BUFFER) || (binding.type == RenderDescriptorRangeType::STRUCTURED_BUFFER) || (binding.type == RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER)) {
-                    layoutEntry.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
-                }
-                else {
-                    // Writable storage isn't allowed in vertex shaders.
-                    layoutEntry.buffer.type = WGPUBufferBindingType_Storage;
-                    layoutEntry.visibility &= ~WGPUShaderStage_Vertex;
-                }
-
+                layoutEntry = layoutEntryFor(device, binding.type, binding.binding, RenderFormat::UNKNOWN, WGPUTextureViewDimension_Undefined, false, nullptr, key);
                 groupEntry.buffer = binding.buffer->buffer;
                 groupEntry.offset = binding.bufferOffset;
                 groupEntry.size = binding.bufferSize;
@@ -1033,7 +1139,6 @@ namespace plume {
                     groupEntry.size = std::min<uint64_t>(alignUp(groupEntry.size, sizeAlignment), binding.buffer->size - groupEntry.offset);
                 }
 
-                appendKey(key, 'b', uint32_t(binding.binding), int32_t(layoutEntry.buffer.type), int32_t(0), int32_t(0));
                 break;
             }
             case RenderDescriptorRangeType::TEXTURE:
@@ -1045,38 +1150,7 @@ namespace plume {
                 const RenderTextureDesc &textureDesc = binding.texture->desc;
                 const RenderTextureViewDesc *viewDesc = (binding.textureView != nullptr) ? &binding.textureView->desc : nullptr;
                 const RenderFormat format = ((viewDesc != nullptr) && (viewDesc->format != RenderFormat::UNKNOWN)) ? viewDesc->format : textureDesc.format;
-                const WGPUTextureViewDimension dimension = viewDimension(textureDesc, viewDesc);
-                if (binding.type == RenderDescriptorRangeType::READ_WRITE_TEXTURE) {
-                    // Core WebGPU reads and writes one storage texture only in r32float, r32uint and r32sint, so
-                    // any other format is write-only, as PlumeWGSL.cmake declares it in the shader too.
-                    const bool readWrite = (format == RenderFormat::R32_FLOAT) || (format == RenderFormat::R32_UINT) || (format == RenderFormat::R32_SINT);
-                    layoutEntry.storageTexture.access = readWrite ? WGPUStorageTextureAccess_ReadWrite : WGPUStorageTextureAccess_WriteOnly;
-                    layoutEntry.storageTexture.format = toWGPU(format);
-                    layoutEntry.storageTexture.viewDimension = dimension;
-                    layoutEntry.visibility &= ~WGPUShaderStage_Vertex;
-                    appendKey(key, 's', uint32_t(binding.binding), int32_t(layoutEntry.storageTexture.format), int32_t(dimension), int32_t(0));
-                }
-                else {
-                    bool isSigned = false;
-                    const bool multisampled = textureDesc.multisampling.sampleCount > 1;
-                    if (RenderFormatIsDepth(format)) {
-                        layoutEntry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
-                    }
-                    else if (isIntegerFormat(format, isSigned)) {
-                        layoutEntry.texture.sampleType = isSigned ? WGPUTextureSampleType_Sint : WGPUTextureSampleType_Uint;
-                    }
-                    else if (multisampled || (isFloat32Format(format) && !device->float32Filterable)) {
-                        layoutEntry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
-                    }
-                    else {
-                        layoutEntry.texture.sampleType = WGPUTextureSampleType_Float;
-                    }
-
-                    layoutEntry.texture.viewDimension = dimension;
-                    layoutEntry.texture.multisampled = multisampled;
-                    appendKey(key, 't', uint32_t(binding.binding), int32_t(layoutEntry.texture.sampleType), int32_t(dimension), int32_t(multisampled));
-                }
-
+                layoutEntry = layoutEntryFor(device, binding.type, binding.binding, format, viewDimension(textureDesc, viewDesc), textureDesc.multisampling.sampleCount > 1, nullptr, key);
                 WebGPUTexture *texture = const_cast<WebGPUTexture *>(binding.texture);
                 if (binding.textureView != nullptr) {
                     groupEntry.textureView = binding.textureView->view;
@@ -1091,27 +1165,14 @@ namespace plume {
                     continue;
                 }
 
-                const RenderSamplerDesc &samplerDesc = binding.sampler->desc;
-                if (samplerDesc.comparisonEnabled) {
-                    layoutEntry.sampler.type = WGPUSamplerBindingType_Comparison;
-                }
-                else if ((samplerDesc.minFilter == RenderFilter::LINEAR) || (samplerDesc.magFilter == RenderFilter::LINEAR) || (samplerDesc.mipmapMode == RenderMipmapMode::LINEAR)) {
-                    layoutEntry.sampler.type = WGPUSamplerBindingType_Filtering;
-                }
-                else {
-                    layoutEntry.sampler.type = WGPUSamplerBindingType_NonFiltering;
-                }
-
+                layoutEntry = layoutEntryFor(device, binding.type, binding.binding, RenderFormat::UNKNOWN, WGPUTextureViewDimension_Undefined, false, &binding.sampler->desc, key);
                 groupEntry.sampler = binding.sampler->sampler;
-                appendKey(key, 'p', uint32_t(binding.binding), int32_t(layoutEntry.sampler.type), int32_t(0), int32_t(0));
                 break;
             }
             default:
                 assert(false && "Unsupported descriptor type.");
                 continue;
             }
-
-            appendKey(key, 'v', uint64_t(layoutEntry.visibility));
 
             // What the entry binds, for the device's bind group cache: a texture without a view binds its default one, or
             // on a storage slot its storage view (the layout's key tells the two apart).
@@ -1235,12 +1296,190 @@ namespace plume {
         this->desc.computeShader = nullptr;
         specConstants.assign(desc.specConstants, desc.specConstants + desc.specConstantsCount);
         this->desc.specConstants = nullptr;
+        self = std::make_shared<WebGPUComputePipeline *>(this);
+
+        // Where the device builds in the background (Chrome), it starts building the pipeline now for the layout its
+        // dispatches will likely resolve to, and again whenever a new binding stage changes that layout (WebGPUShader).
+        // Built at its first dispatch, Chrome compiled it in line on its GPU main thread, where none of the page's GPU
+        // work ran for 50-125 ms on a profile's first visit (RT64's texture decode, framebuffer write and RSP pipelines,
+        // at a game's first frames and first 3D: Dinosaur Planet's page lost sound at its boot's logos to them). A wrong
+        // guess builds one no dispatch uses, and the dispatch builds the one it needs, as before.
+        if (!device->capabilities.backgroundPipelineBuilds) {
+            return;
+        }
+
+        const WebGPUShader *shader = static_cast<const WebGPUShader *>(desc.computeShader);
+        const WebGPUPipelineLayout *pipelineLayout = static_cast<const WebGPUPipelineLayout *>(desc.pipelineLayout);
+        if ((shader == nullptr) || (pipelineLayout == nullptr) || (pipelineLayout->setBindings.size() != pipelineLayout->descriptorSetCount)) {
+            return;
+        }
+
+        setBindings = pipelineLayout->setBindings;
+        descriptorSetCount = pipelineLayout->descriptorSetCount;
+        pushConstants = pipelineLayout->pushConstantsSize > 0;
+        bindingTypes = shader->bindingTypes;
+
+        device->computePipelines.insert(this);
+        buildPredicted();
     }
 
     WebGPUComputePipeline::~WebGPUComputePipeline() {
+        *self = nullptr;
+        device->computePipelines.erase(this);
         for (auto &it : pipelines) {
             wgpuComputePipelineRelease(it.second);
         }
+    }
+
+    void WebGPUComputePipeline::buildPredicted() {
+        WGPUPipelineLayout layout = predictLayout();
+        if ((layout == nullptr) || (pipelines.find(layout) != pipelines.end()) || (pending.find(layout) != pending.end())) {
+            return;
+        }
+
+        std::vector<std::string> keys;
+        std::vector<WGPUConstantEntry> constants = toConstantEntries(specConstants, computeStage, keys);
+        WGPUComputePipelineDescriptor pipelineDesc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+        pipelineDesc.layout = layout;
+        pipelineDesc.compute.module = computeStage.module;
+        pipelineDesc.compute.entryPoint = toStringView(computeStage.entryPointName);
+        pipelineDesc.compute.constantCount = constants.size();
+        pipelineDesc.compute.constants = constants.data();
+
+        WGPUCreateComputePipelineAsyncCallbackInfo callbackInfo = WGPU_CREATE_COMPUTE_PIPELINE_ASYNC_CALLBACK_INFO_INIT;
+        callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+        callbackInfo.callback = [](WGPUCreatePipelineAsyncStatus status, WGPUComputePipeline result, WGPUStringView message, void *userdata1, void *userdata2) {
+            std::shared_ptr<WebGPUComputePipeline *> *pointer = static_cast<std::shared_ptr<WebGPUComputePipeline *> *>(userdata1);
+            WebGPUComputePipeline *pipeline = **pointer;
+            delete pointer;
+
+            if ((status != WGPUCreatePipelineAsyncStatus_Success) && (status != WGPUCreatePipelineAsyncStatus_CallbackCancelled)) {
+                fprintf(stderr, "plume WebGPU: a compute pipeline built in the background failed: %.*s\n", int(message.length), message.data);
+            }
+
+            WGPUPipelineLayout layout = static_cast<WGPUPipelineLayout>(userdata2);
+            if (pipeline != nullptr) {
+                pipeline->pending.erase(layout);
+            }
+
+            if (result == nullptr) {
+                return;
+            }
+
+            // Gone, or built in place by a dispatch that came first.
+            if ((pipeline == nullptr) || (pipeline->pipelines.find(layout) != pipeline->pipelines.end())) {
+                wgpuComputePipelineRelease(result);
+                return;
+            }
+
+            pipeline->pipelines[layout] = result;
+        };
+
+        callbackInfo.userdata1 = new std::shared_ptr<WebGPUComputePipeline *>(self);
+        callbackInfo.userdata2 = layout;
+        pending.insert(layout);
+        wgpuDeviceCreateComputePipelineAsync(device->device, &pipelineDesc, callbackInfo);
+    }
+
+    // What a texture or sampler binding's WGSL type says of what is bound there: a storage texture's format, a sampled
+    // texture's kind of format (a filterable float one for f32), the view's dimension, and a sampler's kind.
+    static bool fromWGSLType(const std::string &type, RenderFormat &format, WGPUTextureViewDimension &dimension, bool &multisampled, RenderSamplerDesc &samplerDesc) {
+        auto startsWith = [&](const char *prefix) { return type.compare(0, strlen(prefix), prefix) == 0; };
+        if (type == "sampler") {
+            samplerDesc.minFilter = RenderFilter::LINEAR;
+            samplerDesc.comparisonEnabled = false;
+            return true;
+        }
+
+        if (type == "sampler_comparison") {
+            samplerDesc.comparisonEnabled = true;
+            return true;
+        }
+
+        const size_t open = type.find('<');
+        if (!startsWith("texture_") || (open == std::string::npos)) {
+            return false;
+        }
+
+        std::string kind = type.substr(strlen("texture_"), open - strlen("texture_"));
+        const std::string argument = type.substr(open + 1, type.find_first_of(",>", open) - open - 1);
+        const bool storage = (kind.compare(0, strlen("storage_"), "storage_") == 0);
+        if (storage) {
+            kind = kind.substr(strlen("storage_"));
+        }
+
+        multisampled = (kind == "multisampled_2d");
+        if (kind == "1d") dimension = WGPUTextureViewDimension_1D;
+        else if ((kind == "2d") || multisampled) dimension = WGPUTextureViewDimension_2D;
+        else if (kind == "2d_array") dimension = WGPUTextureViewDimension_2DArray;
+        else if (kind == "3d") dimension = WGPUTextureViewDimension_3D;
+        else if (kind == "cube") dimension = WGPUTextureViewDimension_Cube;
+        else if (kind == "cube_array") dimension = WGPUTextureViewDimension_CubeArray;
+        else return false;
+
+        static const std::pair<const char *, RenderFormat> formats[] = {
+            { "f32", RenderFormat::R8G8B8A8_UNORM }, { "u32", RenderFormat::R32_UINT }, { "i32", RenderFormat::R32_SINT },
+            { "rgba8unorm", RenderFormat::R8G8B8A8_UNORM }, { "rgba8snorm", RenderFormat::R8G8B8A8_SNORM },
+            { "rgba8uint", RenderFormat::R8G8B8A8_UINT }, { "rgba8sint", RenderFormat::R8G8B8A8_SINT },
+            { "bgra8unorm", RenderFormat::B8G8R8A8_UNORM }, { "rgba16float", RenderFormat::R16G16B16A16_FLOAT },
+            { "rgba16uint", RenderFormat::R16G16B16A16_UINT }, { "rgba32float", RenderFormat::R32G32B32A32_FLOAT },
+            { "rgba32uint", RenderFormat::R32G32B32A32_UINT }, { "rg32float", RenderFormat::R32G32_FLOAT },
+            { "r32float", RenderFormat::R32_FLOAT }, { "r32uint", RenderFormat::R32_UINT }, { "r32sint", RenderFormat::R32_SINT },
+        };
+
+        for (const auto &it : formats) {
+            if (argument == it.first) {
+                format = it.second;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // The layout a dispatch with this pipeline resolves to when every binding of its sets is bound, as RT64 binds them
+    // (WebGPUCommandList::resolveBindings()): the set layouts give each binding's type, and the shader a texture's
+    // format and dimension and a sampler's kind. Null where they don't say (a texture the shader doesn't declare, a
+    // boundless set).
+    WGPUPipelineLayout WebGPUComputePipeline::predictLayout() const {
+        std::vector<WGPUBindGroupLayout> layouts;
+        for (uint32_t i = 0; i < descriptorSetCount; i++) {
+            std::string key;
+            std::vector<WGPUBindGroupLayoutEntry> entries;
+            for (const WebGPUSetBinding &binding : setBindings[i]) {
+                RenderFormat format = RenderFormat::UNKNOWN;
+                WGPUTextureViewDimension dimension = WGPUTextureViewDimension_Undefined;
+                bool multisampled = false;
+                RenderSamplerDesc samplerDesc = binding.samplerDesc;
+                const bool isTexture = (binding.type == RenderDescriptorRangeType::TEXTURE) || (binding.type == RenderDescriptorRangeType::READ_WRITE_TEXTURE);
+                if (isTexture || ((binding.type == RenderDescriptorRangeType::SAMPLER) && !binding.immutableSampler)) {
+                    auto typeIt = bindingTypes.find({ i, binding.binding });
+                    if ((typeIt == bindingTypes.end()) || !fromWGSLType(typeIt->second, format, dimension, multisampled, samplerDesc)) {
+                        return nullptr;
+                    }
+                }
+
+                entries.emplace_back(layoutEntryFor(device, binding.type, binding.binding, format, dimension, multisampled, &samplerDesc, key));
+            }
+
+            WGPUBindGroupLayout setLayout = device->getBindGroupLayout(key, entries);
+            if (pushConstants && (i == PushConstantsGroup)) {
+                entries.emplace_back(device->pushConstantsEntry);
+                setLayout = device->getBindGroupLayout(key + "pushConstants;", entries);
+            }
+
+            layouts.emplace_back(setLayout);
+        }
+
+        if (pushConstants && (descriptorSetCount <= PushConstantsGroup)) {
+            while (layouts.size() < PushConstantsGroup) {
+                layouts.emplace_back(device->emptyLayout);
+            }
+
+            layouts.emplace_back(device->pushConstantsLayout);
+        }
+
+        return device->getPipelineLayout(layouts);
     }
 
     WGPUComputePipeline WebGPUComputePipeline::get(WGPUPipelineLayout layout) {
@@ -1533,6 +1772,31 @@ namespace plume {
 
         for (const RenderPushConstantRange &range : pushConstantRanges) {
             pushConstantsSize = std::max(pushConstantsSize, range.offset + range.size);
+        }
+
+        bool boundless = false;
+        setBindings.resize(descriptorSetCount);
+        for (uint32_t i = 0; i < descriptorSetCount; i++) {
+            const RenderDescriptorSetDesc &setDesc = desc.descriptorSetDescs[i];
+            boundless = boundless || setDesc.lastRangeIsBoundless;
+            for (uint32_t j = 0; j < setDesc.descriptorRangesCount; j++) {
+                const RenderDescriptorRange &range = setDesc.descriptorRanges[j];
+                for (uint32_t k = 0; k < range.count; k++) {
+                    WebGPUSetBinding binding;
+                    binding.type = range.type;
+                    binding.binding = range.binding + k;
+                    if (range.immutableSampler != nullptr) {
+                        binding.immutableSampler = true;
+                        binding.samplerDesc = static_cast<const WebGPUSampler *>(range.immutableSampler[k])->desc;
+                    }
+
+                    setBindings[i].emplace_back(binding);
+                }
+            }
+        }
+
+        if (boundless) {
+            setBindings.clear();
         }
 
         assert(((pushConstantsSize == 0) || (descriptorSetCount <= PushConstantsGroup + 1)) && "Push constants share bind group 3, so a layout with them can have 4 descriptor sets at most.");
