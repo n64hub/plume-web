@@ -1544,7 +1544,8 @@ namespace plume {
         // buildInBackground is too, though it is ready at once: a draw that wants it before it is built builds it in
         // line, and on Chrome's GPU main thread that held a page's presents for as long (RT64's ubershader, one
         // pipeline per depth and coverage state, made at setup: ~1 s the first time a game drew with a third state,
-        // Ocarina of Time's title 25 s after its boot). Firefox builds those in line too, so it builds each when drawn.
+        // Ocarina of Time's title 25 s after its boot). Firefox builds those in line too, so it builds each when drawn,
+        // or drawn with nothing (WebGPUCommandList::prepareDraw()).
         builds = std::make_shared<WebGPURenderPipelineBuilds>();
         builds->device = device;
         builds->pipeline = this;
@@ -2890,14 +2891,22 @@ namespace plume {
 
         // A draw of nothing records nothing, but resolves the bindings as a draw would, which starts the pipelines waiting
         // for that layout (WebGPUGraphicsPipeline) in the background, the bound one included: a renderer draws nothing with
-        // the sets it draws with to have its pipelines built before its first draw needs them.
+        // the sets it draws with to have its pipelines built before its first draw needs them. Where the device builds
+        // in line (Firefox) nothing builds in the background, so the bound one is built here, as a draw would build it:
+        // the browser then has its shaders compiled, and the pipelines with the same shaders in other states build for
+        // about nothing when drawn. RT64's ubershader (one 245 KB pixel shader) cost 1.4 s of Firefox's GPU process
+        // there, the page's sound lost meanwhile, when the game's first draw with it built it in line instead.
         assert((pipeline != nullptr) && (pipeline->type == WebGPUPipeline::Type::Graphics));
         WGPUPipelineLayout layout = resolveBindings(graphics, !drawsNothing);
+        const WebGPUGraphicsPipeline *graphicsPipeline = static_cast<const WebGPUGraphicsPipeline *>(pipeline);
         if (drawsNothing) {
+            if (!device->capabilities.backgroundPipelineBuilds) {
+                const_cast<WebGPUGraphicsPipeline *>(graphicsPipeline)->get(layout);
+            }
+
             return false;
         }
 
-        const WebGPUGraphicsPipeline *graphicsPipeline = static_cast<const WebGPUGraphicsPipeline *>(pipeline);
         setPassPipeline(const_cast<WebGPUGraphicsPipeline *>(graphicsPipeline)->get(layout));
         if (graphicsPipeline->desc.stencilEnabled && (!pass.stencilReferenceSet || (pass.stencilReference != graphicsPipeline->desc.stencilReference))) {
             wgpuRenderPassEncoderSetStencilReference(renderPass, graphicsPipeline->desc.stencilReference);
