@@ -4143,7 +4143,11 @@ namespace plume {
         capabilities.sampleLocations = (sampleLocationProperties.sampleLocationSampleCounts != 0);
         capabilities.resolveRegion = true;
         capabilities.resolveModes = false;
-        capabilities.descriptorIndexing = descriptorIndexingSupported;
+        // Mesa's lavapipe (Mesa's vendor ID, Vulkan on the CPU) reports descriptor indexing but miscompiles a fragment
+        // shader's non-uniformly indexed texture array (Mesa 25.2 to 26.2): its loop over the lanes' indices took the
+        // set's address from a lane that held 0 for it, read a descriptor near address 0 and crashed the program.
+        // Without the capability a renderer binds its textures per draw, as it does on WebGPU, and never indexes one.
+        capabilities.descriptorIndexing = descriptorIndexingSupported && (uint32_t(description.vendor) != VK_VENDOR_ID_MESA);
         capabilities.scalarBlockLayout = scalarBlockLayoutSupported;
         capabilities.bufferDeviceAddress = bufferDeviceAddressSupported;
         capabilities.samplerMirrorClampToEdge = supportedOptionalExtensions.find(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) != supportedOptionalExtensions.end();
