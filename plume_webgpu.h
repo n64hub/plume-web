@@ -29,11 +29,13 @@
 //   any draw resolved that layout, it waits for the first one to. Behind plume_device_thread.h, createGraphicsPipeline()
 //   waits for isReady() on the calling thread, which draws with another pipeline meanwhile. A draw with a layout the
 //   pipeline wasn't built for (a new binding stage changes them all) builds it in place, as any other pipeline is.
-//   Where the browser builds those off the device (Chrome), a compute pipeline is built with createComputePipelineAsync
-//   when it is created, for the layout its dispatches will likely resolve to: every binding of its sets bound, with
-//   what the set layouts don't say (a texture's format and dimension, a sampler's filtering) read from its shader's
-//   declarations, and again when a new binding stage changes that layout. A dispatch with another layout, or before
-//   that build is done, builds it in place.
+//   A compute pipeline is built when it is created, for the layout its dispatches will likely resolve to: every binding
+//   of its sets bound, with what the set layouts don't say (a texture's format and dimension, a sampler's filtering)
+//   read from its shader's declarations, and again when a new binding stage changes that layout. Where the browser
+//   builds those off the device (Chrome) it is built with createComputePipelineAsync; in Firefox in line, at the
+//   device's next submission, once the shaders made with it have settled their binding stages, which costs the GPU
+//   process the build there (RT64's: at the launcher) and not at its first dispatch. A dispatch with another layout,
+//   or before that build is done, builds it in place.
 // - Buffer mapping is asynchronous. An UPLOAD buffer keeps a CPU copy: map() returns it and unmap() writes it to the
 //   GPU, and a buffer left mapped is written in full on every executeCommandLists(), since a persistently mapped
 //   D3D12-style upload buffer never says what changed. A READBACK buffer that a submitted command list copied into
@@ -342,13 +344,14 @@ namespace plume {
         bool pushConstants = false;
         std::map<std::pair<uint32_t, uint32_t>, std::string> bindingTypes;
         std::set<WGPUPipelineLayout> pending;
+        bool predictionPending = false;
         std::shared_ptr<WebGPUComputePipeline *> self;
 
         WebGPUComputePipeline(WebGPUDevice *device, const RenderComputePipelineDesc &desc);
         ~WebGPUComputePipeline() override;
         WGPUComputePipeline get(WGPUPipelineLayout layout);
         WGPUPipelineLayout predictLayout() const;
-        void buildPredicted();
+        void buildPredicted(bool now = false);
     };
 
     // A graphics pipeline's builds in flight, shared with their callbacks, which can run after it is gone.
@@ -710,8 +713,10 @@ namespace plume {
         std::list<std::string> bindGroupUses;
         std::unordered_map<uint32_t, WGPUShaderStage> bindingStages;
         uint64_t bindingStagesRevision = 0;
-        // The compute pipelines built in the background, built again for their predicted layout when a binding stage changes it.
+        // The compute pipelines built for their predicted layout, built again when a binding stage changes it, and
+        // whether any has a build that waits for the next submission (Firefox: WebGPUComputePipeline::buildPredicted()).
         std::set<WebGPUComputePipeline *> computePipelines;
+        bool computePredictionsPending = false;
         std::map<std::vector<WGPUBindGroupLayout>, WGPUPipelineLayout> pipelineLayouts;
         std::vector<WebGPUBuffer *> mappedBuffers;
         WGPUShaderModule clearShader = nullptr;

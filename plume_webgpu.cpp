@@ -1298,16 +1298,16 @@ namespace plume {
         this->desc.specConstants = nullptr;
         self = std::make_shared<WebGPUComputePipeline *>(this);
 
-        // Where the device builds in the background (Chrome), it starts building the pipeline now for the layout its
-        // dispatches will likely resolve to, and again whenever a new binding stage changes that layout (WebGPUShader).
-        // Built at its first dispatch, Chrome compiled it in line on its GPU main thread, where none of the page's GPU
-        // work ran for 50-125 ms on a profile's first visit (RT64's texture decode, framebuffer write and RSP pipelines,
-        // at a game's first frames and first 3D: Dinosaur Planet's page lost sound at its boot's logos to them). A wrong
-        // guess builds one no dispatch uses, and the dispatch builds the one it needs, as before.
-        if (!device->capabilities.backgroundPipelineBuilds) {
-            return;
-        }
-
+        // The pipeline is built now for the layout its dispatches will likely resolve to, and again whenever a new
+        // binding stage changes that layout (WebGPUShader), so it isn't built at its first dispatch. Built there, the
+        // browser compiled it in line, with none of the page's GPU work running meanwhile: 50-125 ms each on Chrome's
+        // GPU main thread on a profile's first visit, and in Firefox's GPU process up to 1.7 s of round trips with the
+        // others built beside it (RT64's texture decode, framebuffer write and RSP pipelines, at a game's first frames
+        // and first 3D: Dinosaur Planet's page lost sound at its boot's logos to them in both). Where the device builds
+        // in the background (Chrome) it builds with createComputePipelineAsync; in Firefox, whose GPU process builds
+        // every pipeline in line, with createComputePipeline at the next submission, which costs the GPU process the
+        // build there (RT64's: at the launcher) instead. A wrong guess builds one no dispatch uses, and the dispatch
+        // builds the one it needs, as before.
         const WebGPUShader *shader = static_cast<const WebGPUShader *>(desc.computeShader);
         const WebGPUPipelineLayout *pipelineLayout = static_cast<const WebGPUPipelineLayout *>(desc.pipelineLayout);
         if ((shader == nullptr) || (pipelineLayout == nullptr) || (pipelineLayout->setBindings.size() != pipelineLayout->descriptorSetCount)) {
@@ -1331,7 +1331,18 @@ namespace plume {
         }
     }
 
-    void WebGPUComputePipeline::buildPredicted() {
+    void WebGPUComputePipeline::buildPredicted(bool now) {
+        // Firefox builds it in line, so it waits for the next submission (WebGPUCommandQueue::executeCommandLists()):
+        // RT64 makes its compute pipelines before the shaders whose binding stages change their layouts, and building
+        // each where it was made built 8 of the 21 twice, 29 builds in 1.9 s of Firefox's GPU process at Dinosaur
+        // Planet's launcher.
+        if (!device->capabilities.backgroundPipelineBuilds && !now) {
+            predictionPending = true;
+            device->computePredictionsPending = true;
+            return;
+        }
+
+        predictionPending = false;
         WGPUPipelineLayout layout = predictLayout();
         if ((layout == nullptr) || (pipelines.find(layout) != pipelines.end()) || (pending.find(layout) != pending.end())) {
             return;
@@ -1345,6 +1356,11 @@ namespace plume {
         pipelineDesc.compute.entryPoint = toStringView(computeStage.entryPointName);
         pipelineDesc.compute.constantCount = constants.size();
         pipelineDesc.compute.constants = constants.data();
+
+        if (!device->capabilities.backgroundPipelineBuilds) {
+            pipelines[layout] = wgpuDeviceCreateComputePipeline(device->device, &pipelineDesc);
+            return;
+        }
 
         WGPUCreateComputePipelineAsyncCallbackInfo callbackInfo = WGPU_CREATE_COMPUTE_PIPELINE_ASYNC_CALLBACK_INFO_INIT;
         callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
@@ -3357,6 +3373,15 @@ namespace plume {
     }
 
     void WebGPUCommandQueue::executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) {
+        if (device->computePredictionsPending) {
+            device->computePredictionsPending = false;
+            for (WebGPUComputePipeline *pipeline : device->computePipelines) {
+                if (pipeline->predictionPending) {
+                    pipeline->buildPredicted(true);
+                }
+            }
+        }
+
         device->flushMappedBuffers();
 
         std::vector<WGPUCommandBuffer> commandBuffers;
