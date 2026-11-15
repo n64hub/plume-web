@@ -768,9 +768,21 @@ namespace plume {
         }
     }
 
+    // A resource, query heap or pipeline whose creation failed has no D3D12 object: a removed device's creations fail
+    // (DXGI_ERROR_DEVICE_REMOVED), and the threads that run into the removal go on until the application replaces the
+    // device (RenderDevice::isLost()). What would name, map, copy, bind or barrier one is skipped, and its GPU address is
+    // 0, as what is written into a removed device's buffers is skipped where they map to nullptr.
     static void setObjectName(ID3D12Object *object, const std::string &name) {
+        if (object == nullptr) {
+            return;
+        }
+
         const std::wstring wideCharName = Utf8ToUtf16(name);
         object->SetName(wideCharName.c_str());
+    }
+
+    static D3D12_GPU_VIRTUAL_ADDRESS gpuAddressOf(const D3D12Buffer *buffer, uint64_t offset) {
+        return ((buffer != nullptr) && (buffer->d3d != nullptr)) ? (buffer->d3d->GetGPUVirtualAddress() + offset) : 0;
     }
 
     // D3D12DescriptorHeapAllocator
@@ -1267,7 +1279,7 @@ namespace plume {
         RenderDescriptorRangeType descriptorType = descriptorTypes[descriptorIndexClamped];
         assert((descriptorType == RenderDescriptorRangeType::ACCELERATION_STRUCTURE) && "Incompatible descriptor type.");
 
-        if (interfaceAccelerationStructure != nullptr) {
+        if ((interfaceAccelerationStructure != nullptr) && (interfaceAccelerationStructure->buffer->d3d != nullptr)) {
             D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
             srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
@@ -1788,18 +1800,20 @@ namespace plume {
 
         this->device = device;
 
+        // A pool whose heap couldn't be made still has its count of results, all 0.
+        results.resize(queryCount, 0);
+
         D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
         queryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
         queryHeapDesc.Count = queryCount;
 
-        HRESULT res = device->d3d->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&d3d));
+        HRESULT res = device->lostTest.lost() ? DXGI_ERROR_DEVICE_REMOVED : device->d3d->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&d3d));
         if (FAILED(res)) {
             fprintf(stderr, "CreateQueryHeap failed with error code 0x%lX.\n", res);
             return;
         }
 
         readbackBuffer = device->createBuffer(RenderBufferDesc::ReadbackBuffer(sizeof(uint64_t) * queryCount));
-        results.resize(queryCount);
     }
 
     D3D12QueryPool::~D3D12QueryPool() {
@@ -1809,7 +1823,13 @@ namespace plume {
     }
 
     void D3D12QueryPool::queryResults() {
-        void *readbackData = readbackBuffer->map();
+        // No heap, or a readback buffer that maps to nothing (its device removed): the results are 0.
+        void *readbackData = (readbackBuffer != nullptr) ? readbackBuffer->map() : nullptr;
+        if (readbackData == nullptr) {
+            std::fill(results.begin(), results.end(), 0);
+            return;
+        }
+
         memcpy(results.data(), readbackData, sizeof(uint64_t) * results.size());
         readbackBuffer->unmap();
 
@@ -1915,7 +1935,7 @@ namespace plume {
         auto makeBarrier = [&](ID3D12Resource *resource, D3D12_RESOURCE_STATES stateBefore, D3D12_RESOURCE_STATES stateAfter, bool supportsUAV, D3D12_RESOURCE_BARRIER &resourceBarrier) {
             resourceBarrier = {};
 
-            if (queue->type == RenderCommandListType::COPY) {
+            if ((queue->type == RenderCommandListType::COPY) || (resource == nullptr)) {
                 return false;
             }
 
@@ -1998,6 +2018,9 @@ namespace plume {
         const D3D12Buffer *interfaceBuffer = static_cast<const D3D12Buffer *>(shaderBindingTable.ref);
         assert(interfaceBuffer != nullptr);
         assert((interfaceBuffer->desc.flags & RenderBufferFlag::SHADER_BINDING_TABLE) && "Buffer must allow being used as a shader binding table.");
+        if (interfaceBuffer->d3d == nullptr) {
+            return;
+        }
 
         D3D12_GPU_VIRTUAL_ADDRESS tableAddress = interfaceBuffer->d3d->GetGPUVirtualAddress() + shaderBindingTable.offset;
         const RenderShaderBindingGroupInfo &rayGen = shaderBindingGroupsInfo.rayGen;
@@ -2047,19 +2070,28 @@ namespace plume {
         switch (interfacePipeline->type) {
         case D3D12Pipeline::Type::Compute: {
             const D3D12ComputePipeline *computePipeline = static_cast<const D3D12ComputePipeline *>(interfacePipeline);
-            d3d->SetPipelineState(computePipeline->d3d);
+            if (computePipeline->d3d != nullptr) {
+                d3d->SetPipelineState(computePipeline->d3d);
+            }
+
             break;
         }
         case D3D12Pipeline::Type::Graphics: {
             const D3D12GraphicsPipeline *graphicsPipeline = static_cast<const D3D12GraphicsPipeline *>(interfacePipeline);
-            d3d->SetPipelineState(graphicsPipeline->d3d);
+            if (graphicsPipeline->d3d != nullptr) {
+                d3d->SetPipelineState(graphicsPipeline->d3d);
+            }
+
             activeGraphicsPipeline = graphicsPipeline;
             break;
         }
         case D3D12Pipeline::Type::Raytracing: {
             assert(d3dV4 != nullptr);
             const D3D12RaytracingPipeline *raytracingPipeline = static_cast<const D3D12RaytracingPipeline *>(interfacePipeline);
-            d3dV4->SetPipelineState1(raytracingPipeline->stateObject);
+            if (raytracingPipeline->stateObject != nullptr) {
+                d3dV4->SetPipelineState1(raytracingPipeline->stateObject);
+            }
+
             break;
         }
         default:
@@ -2140,7 +2172,7 @@ namespace plume {
         if (view != nullptr) {
             const D3D12Buffer *interfaceBuffer = static_cast<const D3D12Buffer *>(view->buffer.ref);
             D3D12_INDEX_BUFFER_VIEW bufferView;
-            bufferView.BufferLocation = (interfaceBuffer != nullptr) ? (interfaceBuffer->d3d->GetGPUVirtualAddress() + view->buffer.offset) : 0;
+            bufferView.BufferLocation = gpuAddressOf(interfaceBuffer, view->buffer.offset);
             bufferView.Format = toDXGI(view->format);
             bufferView.SizeInBytes = view->size;
             d3d->IASetIndexBuffer(&bufferView);
@@ -2159,7 +2191,7 @@ namespace plume {
             for (uint32_t i = 0; i < viewCount; i++) {
                 const RenderVertexBufferView &renderView = views[i];
                 const D3D12Buffer *interfaceBuffer = static_cast<const D3D12Buffer *>(renderView.buffer.ref);
-                bufferViewVector[i].BufferLocation = (interfaceBuffer != nullptr) ? (interfaceBuffer->d3d->GetGPUVirtualAddress() + renderView.buffer.offset) : 0;
+                bufferViewVector[i].BufferLocation = gpuAddressOf(interfaceBuffer, renderView.buffer.offset);
                 bufferViewVector[i].SizeInBytes = renderView.size;
 
                 bool slotFound = false;
@@ -2303,6 +2335,10 @@ namespace plume {
 
         const D3D12Buffer *interfaceDstBuffer = static_cast<const D3D12Buffer *>(dstBuffer.ref);
         const D3D12Buffer *interfaceSrcBuffer = static_cast<const D3D12Buffer *>(srcBuffer.ref);
+        if ((interfaceDstBuffer->d3d == nullptr) || (interfaceSrcBuffer->d3d == nullptr)) {
+            return;
+        }
+
         d3d->CopyBufferRegion(interfaceDstBuffer->d3d, dstBuffer.offset, interfaceSrcBuffer->d3d, srcBuffer.offset, size);
     }
 
@@ -2319,6 +2355,10 @@ namespace plume {
 
         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
+        if ((copyDstLocation.pResource == nullptr) || (copySrcLocation.pResource == nullptr)) {
+            return;
+        }
+
         setSamplePositions(dstLocation.texture);
         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
         resetSamplePositions();
@@ -2330,6 +2370,10 @@ namespace plume {
 
         const D3D12Buffer *interfaceDstBuffer = static_cast<const D3D12Buffer *>(dstBuffer);
         const D3D12Buffer *interfaceSrcBuffer = static_cast<const D3D12Buffer *>(srcBuffer);
+        if ((interfaceDstBuffer->d3d == nullptr) || (interfaceSrcBuffer->d3d == nullptr)) {
+            return;
+        }
+
         d3d->CopyResource(interfaceDstBuffer->d3d, interfaceSrcBuffer->d3d);
     }
 
@@ -2339,6 +2383,10 @@ namespace plume {
 
         const D3D12Texture *interfaceDstTexture = static_cast<const D3D12Texture *>(dstTexture);
         const D3D12Texture *interfaceSrcTexture = static_cast<const D3D12Texture *>(srcTexture);
+        if ((interfaceDstTexture->d3d == nullptr) || (interfaceSrcTexture->d3d == nullptr)) {
+            return;
+        }
+
         setSamplePositions(interfaceDstTexture);
         d3d->CopyResource(interfaceDstTexture->d3d, interfaceSrcTexture->d3d);
         resetSamplePositions();
@@ -2350,6 +2398,10 @@ namespace plume {
 
         const D3D12Texture *interfaceDstTexture = static_cast<const D3D12Texture *>(dstTexture);
         const D3D12Texture *interfaceSrcTexture = static_cast<const D3D12Texture *>(srcTexture);
+        if ((interfaceDstTexture->d3d == nullptr) || (interfaceSrcTexture->d3d == nullptr)) {
+            return;
+        }
+
         setSamplePositions(interfaceDstTexture);
         d3d->ResolveSubresource(interfaceDstTexture->d3d, 0, interfaceSrcTexture->d3d, 0, toDXGI(interfaceDstTexture->desc.format));
         resetSamplePositions();
@@ -2362,6 +2414,10 @@ namespace plume {
 
         const D3D12Texture *interfaceDstTexture = static_cast<const D3D12Texture *>(dstTexture);
         const D3D12Texture *interfaceSrcTexture = static_cast<const D3D12Texture *>(srcTexture);
+        if ((interfaceDstTexture->d3d == nullptr) || (interfaceSrcTexture->d3d == nullptr)) {
+            return;
+        }
+
         D3D12_RECT rect;
         if (srcRect != nullptr) {
             rect.left = srcRect->left;
@@ -2385,6 +2441,9 @@ namespace plume {
         
         const D3D12Buffer *interfaceScratchBuffer = static_cast<const D3D12Buffer *>(scratchBuffer.ref);
         assert((interfaceScratchBuffer->desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_SCRATCH) && "Scratch buffer must be allowed.");
+        if ((interfaceAccelerationStructure->buffer->d3d == nullptr) || (interfaceScratchBuffer->d3d == nullptr)) {
+            return;
+        }
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
         buildDesc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
@@ -2412,6 +2471,9 @@ namespace plume {
 
         const D3D12Buffer *interfaceInstancesBuffer = static_cast<const D3D12Buffer *>(instancesBuffer.ref);
         assert((interfaceInstancesBuffer->desc.flags & RenderBufferFlag::ACCELERATION_STRUCTURE_INPUT) && "Acceleration structure input must be allowed.");
+        if ((interfaceAccelerationStructure->buffer->d3d == nullptr) || (interfaceScratchBuffer->d3d == nullptr) || (interfaceInstancesBuffer->d3d == nullptr)) {
+            return;
+        }
 
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC buildDesc = {};
         buildDesc.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
@@ -2427,6 +2489,10 @@ namespace plume {
 
     void D3D12CommandList::discardTexture(const RenderTexture* texture) {
         const D3D12Texture* interfaceTexture = static_cast<const D3D12Texture*>(texture);
+        if (interfaceTexture->d3d == nullptr) {
+            return;
+        }
+
         d3d->DiscardResource(interfaceTexture->d3d, nullptr);
     }
 
@@ -2439,6 +2505,10 @@ namespace plume {
 
         const D3D12QueryPool *interfaceQueryPool = static_cast<const D3D12QueryPool *>(queryPool);
         const D3D12Buffer *readbackBuffer = static_cast<const D3D12Buffer *>(interfaceQueryPool->readbackBuffer.get());
+        if ((interfaceQueryPool->d3d == nullptr) || (readbackBuffer == nullptr) || (readbackBuffer->d3d == nullptr)) {
+            return;
+        }
+
         d3d->EndQuery(interfaceQueryPool->d3d, D3D12_QUERY_TYPE_TIMESTAMP, queryIndex);
         d3d->ResolveQueryData(interfaceQueryPool->d3d, D3D12_QUERY_TYPE_TIMESTAMP, queryIndex, 1, readbackBuffer->d3d, queryIndex * sizeof(uint64_t));
     }
@@ -2548,7 +2618,11 @@ namespace plume {
     void D3D12CommandList::setRootDescriptor(const D3D12PipelineLayout* activePipelineLayout, RenderBufferReference bufferReference, uint32_t rootDescriptorIndex, bool setCompute) {
         assert(rootDescriptorIndex < activePipelineLayout->rootDescriptorRootIndicesAndTypes.size());
 
-        D3D12_GPU_VIRTUAL_ADDRESS gpuVA = static_cast<const D3D12Buffer*>(bufferReference.ref)->d3d->GetGPUVirtualAddress() + bufferReference.offset;
+        const D3D12_GPU_VIRTUAL_ADDRESS gpuVA = gpuAddressOf(static_cast<const D3D12Buffer *>(bufferReference.ref), bufferReference.offset);
+        if (gpuVA == 0) {
+            return;
+        }
+
         const auto& [rootParamIndex, type] = activePipelineLayout->rootDescriptorRootIndicesAndTypes[rootDescriptorIndex];
 
         if (setCompute) {
@@ -2773,7 +2847,8 @@ namespace plume {
         allocationDesc.HeapType = toD3D12(desc.heapType);
         allocationDesc.CustomPool = (pool != nullptr) ? pool->d3d : nullptr;
 
-        HRESULT res = device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, nullptr, &allocation, IID_PPV_ARGS(&d3d));
+        // Under PLUME_LOSE_DEVICE_AFTER a lost device's creations fail as a removed device's do.
+        HRESULT res = device->lostTest.lost() ? DXGI_ERROR_DEVICE_REMOVED : device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, nullptr, &allocation, IID_PPV_ARGS(&d3d));
         if (FAILED(res)) {
             fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
             return;
@@ -2815,6 +2890,10 @@ namespace plume {
             range.End = writtenRange->end;
         }
 
+        if (d3d == nullptr) {
+            return;
+        }
+
         d3d->Unmap(subresource, (writtenRange != nullptr) ? &range : nullptr);
     }
 
@@ -2828,7 +2907,7 @@ namespace plume {
 
     uint64_t D3D12Buffer::getDeviceAddress() const {
         assert((desc.flags & RenderBufferFlag::DEVICE_ADDRESSABLE) != 0 && "Buffer must have been created with GPU_ADDRESSABLE flag.");
-        return d3d->GetGPUVirtualAddress();
+        return gpuAddressOf(this, 0);
     }
 
     // D3D12BufferFormattedView
@@ -2898,7 +2977,7 @@ namespace plume {
             memcpy(optimizedClearValue.Color, desc.optimizedClearValue->color.rgba, sizeof(optimizedClearValue.Color));
         }
 
-        HRESULT res = device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, (desc.optimizedClearValue != nullptr) ? &optimizedClearValue : nullptr, &allocation, IID_PPV_ARGS(&d3d));
+        HRESULT res = device->lostTest.lost() ? DXGI_ERROR_DEVICE_REMOVED : device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, (desc.optimizedClearValue != nullptr) ? &optimizedClearValue : nullptr, &allocation, IID_PPV_ARGS(&d3d));
         if (FAILED(res)) {
             fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
             return;
@@ -3688,6 +3767,16 @@ namespace plume {
                 continue;
             }
 
+            // D3D12CreateDevice gives back an adapter's device while anything made on it is alive, a removed one too:
+            // that one can make nothing, so the adapter is passed over.
+            const HRESULT removedReason = deviceOption->GetDeviceRemovedReason();
+            if (removedReason != S_OK) {
+                fprintf(stderr, "D3D12: the adapter's device is still the removed one (0x%08lX): something made on it is still alive.\n", (unsigned long)(removedReason));
+                deviceOption->Release();
+                adapterOption->Release();
+                continue;
+            }
+
             // Determine the shader model supported by the device.
 #       if SM_5_1_SUPPORTED
             const D3D_SHADER_MODEL supportedShaderModels[] = { D3D_SHADER_MODEL_6_0, D3D_SHADER_MODEL_5_1 };
@@ -3901,7 +3990,7 @@ namespace plume {
 
         // Create a command queue only for retrieving the timestamp frequency. Delete it immediately afterwards.
         std::unique_ptr<D3D12CommandQueue> timestampCommandQueue = std::make_unique<D3D12CommandQueue>(this, RenderCommandListType::DIRECT);
-        res = timestampCommandQueue->d3d->GetTimestampFrequency(&timestampFrequency);
+        res = (timestampCommandQueue->d3d != nullptr) ? timestampCommandQueue->d3d->GetTimestampFrequency(&timestampFrequency) : E_FAIL;
         if (FAILED(res)) {
             fprintf(stderr, "GetTimestampFrequency failed with error code 0x%lX. Timestamps will be inaccurate.\n", res);
         }
@@ -4007,8 +4096,8 @@ namespace plume {
             geometryDesc.Triangles.VertexFormat = toDXGI(mesh.vertexFormat);
             geometryDesc.Triangles.IndexCount = mesh.indexCount;
             geometryDesc.Triangles.VertexCount = mesh.vertexCount;
-            geometryDesc.Triangles.IndexBuffer = (interfaceIndexBuffer != nullptr) ? (interfaceIndexBuffer->d3d->GetGPUVirtualAddress() + mesh.indexBuffer.offset) : 0;
-            geometryDesc.Triangles.VertexBuffer.StartAddress = (interfaceVertexBuffer != nullptr) ? (interfaceVertexBuffer->d3d->GetGPUVirtualAddress() + mesh.vertexBuffer.offset) : 0;
+            geometryDesc.Triangles.IndexBuffer = gpuAddressOf(interfaceIndexBuffer, mesh.indexBuffer.offset);
+            geometryDesc.Triangles.VertexBuffer.StartAddress = gpuAddressOf(interfaceVertexBuffer, mesh.vertexBuffer.offset);
             geometryDesc.Triangles.VertexBuffer.StrideInBytes = mesh.vertexStride;
         }
 
@@ -4047,7 +4136,7 @@ namespace plume {
             instanceDesc.InstanceMask = instance.instanceMask;
             instanceDesc.InstanceContributionToHitGroupIndex = instance.instanceContributionToHitGroupIndex;
             instanceDesc.Flags = instance.cullDisable ? D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE : D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
-            instanceDesc.AccelerationStructure = interfaceBottomLevelAS->d3d->GetGPUVirtualAddress() + instance.bottomLevelAS.offset;
+            instanceDesc.AccelerationStructure = gpuAddressOf(interfaceBottomLevelAS, instance.bottomLevelAS.offset);
             memcpy(instanceDesc.Transform, instance.transform.m, sizeof(instanceDesc.Transform));
         }
 
