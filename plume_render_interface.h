@@ -288,11 +288,15 @@ namespace plume {
         // A backend that delivers a READBACK buffer's data asynchronously (WebGPU's) calls this back each time some
         // arrives, on the thread it delivers it on, so a thread waiting for isMapReady() can be answered then.
         virtual void setReadbackCallback(void (*callback)()) { }
+#endif
 
         // Whether the device was lost and the interface's createDevice() now makes a new one to carry on with: a
-        // WebGPU device once the page has another in its place (plume_webgpu_device.js). Any thread may ask.
+        // WebGPU device once the page has another in its place (plume_webgpu_device.js), a D3D12 device once it is
+        // removed (a TDR, a driver's fault or update: GetDeviceRemovedReason()), a Vulkan device once a submit, a fence
+        // wait, an acquire or a present has returned VK_ERROR_DEVICE_LOST. A lost device's buffers may map() to nullptr,
+        // and its fence and present waits return. Any thread may ask. PLUME_LOSE_DEVICE_AFTER tests it on D3D12 and
+        // Vulkan (plume_lost_device_test.h).
         virtual bool isLost() const { return false; }
-#endif
     };
 
     struct RenderInterface {

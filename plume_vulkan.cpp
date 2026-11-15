@@ -902,6 +902,10 @@ namespace plume {
     }
 
     void *VulkanBuffer::map(uint32_t subresource, const RenderRange *readRange) {
+        if (device->lostTest.lost()) {
+            return nullptr;
+        }
+
         void *data = nullptr;
         VkResult res = vmaMapMemory(device->allocator, allocation, &data);
         if (res != VK_SUCCESS) {
@@ -2286,6 +2290,8 @@ namespace plume {
             res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
         }
 
+        commandQueue->device->checkLost(res, "vkQueuePresentKHR");
+
 #if defined(__APPLE__)
         // Under MoltenVK, VK_SUBOPTIMAL_KHR does not result in a valid state for rendering. We intentionally
         // only check for this error during present to avoid having to synchronize manually against the semaphore
@@ -2305,7 +2311,8 @@ namespace plume {
 
         if (currentPresentId >= desc.maxFrameLatency) {
             constexpr uint64_t waitTimeout = 100000000;
-            vkWaitForPresentKHR(commandQueue->device->vk, vk, currentPresentId - (desc.maxFrameLatency - 1), waitTimeout);
+            VkResult res = vkWaitForPresentKHR(commandQueue->device->vk, vk, currentPresentId - (desc.maxFrameLatency - 1), waitTimeout);
+            commandQueue->device->checkLost(res, "vkWaitForPresentKHR");
         }
     }
 
@@ -2487,6 +2494,7 @@ namespace plume {
 
         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
         VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
+        commandQueue->device->checkLost(res, "vkAcquireNextImageKHR");
         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
             return false;
         }
@@ -3642,6 +3650,8 @@ namespace plume {
             res = vkQueueSubmit(queue->vk, 1, &submitInfo, submitFence);
         }
 
+        device->checkLost(res, "vkQueueSubmit");
+
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkQueueSubmit failed with error code 0x%X.\n", res);
             return;
@@ -3653,6 +3663,7 @@ namespace plume {
 
         VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
         VkResult res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, UINT64_MAX);
+        device->checkLost(res, "vkWaitForFences");
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
             return;
@@ -4466,6 +4477,23 @@ namespace plume {
 
     bool VulkanDevice::isValid() const {
         return vk != nullptr;
+    }
+
+    // Lost to a driver's fault, reset or update, or the GPU going away, as the first call to see it returned. Which call
+    // that was is logged, once.
+    void VulkanDevice::checkLost(VkResult res, const char *call) {
+        if ((res == VK_ERROR_DEVICE_LOST) && !lost.exchange(true)) {
+            fprintf(stderr, "Vulkan: the device was lost (VK_ERROR_DEVICE_LOST from %s).\n", call);
+        }
+    }
+
+    bool VulkanDevice::isLost() const {
+        if (lost) {
+            return true;
+        }
+
+        lostTest.arm();
+        return lostTest.lost();
     }
 
     bool VulkanDevice::beginCapture() {

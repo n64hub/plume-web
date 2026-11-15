@@ -8,6 +8,7 @@
 #pragma once
 
 #include "plume_render_interface.h"
+#include "plume_lost_device_test.h"
 
 #include <mutex>
 #include <set>
@@ -417,6 +418,8 @@ namespace plume {
         std::unique_ptr<RenderBuffer> nullBuffer;
         bool loadStoreOpNoneSupported = false;
         bool nullDescriptorSupported = false;
+        std::atomic<bool> lost = false;
+        LostDeviceTest lostTest;
 
         VulkanDevice(VulkanInterface *renderInterface, const std::string &preferredDeviceName);
         ~VulkanDevice() override;
@@ -446,6 +449,8 @@ namespace plume {
         bool isValid() const;
         bool beginCapture() override;
         bool endCapture() override;
+        bool isLost() const override;
+        void checkLost(VkResult res, const char *call);
     };
 
     struct VulkanInterface : RenderInterface {

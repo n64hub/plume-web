@@ -65,6 +65,7 @@ else()
     set(PLUME_SOURCES
         plume_vulkan.cpp
         plume_vulkan.h
+        plume_lost_device_test.h
     )
 endif()
 

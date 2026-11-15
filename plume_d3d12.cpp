@@ -1394,14 +1394,21 @@ namespace plume {
         UINT syncInterval = (vsyncEnabled && !desc.enablePresentWait) ? 1 : 0;
         UINT flags = (!vsyncEnabled && tearingAllowed) ? DXGI_PRESENT_ALLOW_TEARING : 0;
         HRESULT res = d3d->Present(syncInterval, flags);
+        if (FAILED(res)) {
+            // Logs a removal's reason, once.
+            commandQueue->device->isLost();
+        }
+
         return SUCCEEDED(res);
     }
 
     void D3D12SwapChain::wait() {
         assert(desc.enablePresentWait && "Present wait should've been explicitly enabled during swap chain creation before using the wait function.");
 
+        // A removed device's swap chain needn't signal its waitable object again: the wait gives up once it is removed.
         if (waitableObject != NULL) {
-            WaitForSingleObject(waitableObject, INFINITE);
+            while ((WaitForSingleObject(waitableObject, 100) == WAIT_TIMEOUT) && !commandQueue->device->isLost()) {
+            }
         }
     }
 
@@ -2705,7 +2712,11 @@ namespace plume {
         if (signalFence != nullptr) {
             D3D12CommandFence *interfaceFence = static_cast<D3D12CommandFence *>(signalFence);
             d3d->Signal(interfaceFence->d3d, interfaceFence->fenceValue);
-            interfaceFence->d3d->SetEventOnCompletion(interfaceFence->fenceValue, interfaceFence->fenceEvent);
+            if (FAILED(interfaceFence->d3d->SetEventOnCompletion(interfaceFence->fenceValue, interfaceFence->fenceEvent))) {
+                // A removed device's fence: what it waited for will never be done, so nothing waits for it.
+                SetEvent(interfaceFence->fenceEvent);
+            }
+
             interfaceFence->fenceValue++;
         }
     }
@@ -2713,8 +2724,10 @@ namespace plume {
     void D3D12CommandQueue::waitForCommandFence(RenderCommandFence *fence) {
         assert(fence != nullptr);
 
+        // Gives up once the device is removed, whose fences needn't signal what they were set to.
         D3D12CommandFence *interfaceFence = static_cast<D3D12CommandFence *>(fence);
-        WaitForSingleObjectEx(interfaceFence->fenceEvent, INFINITE, FALSE);
+        while ((WaitForSingleObjectEx(interfaceFence->fenceEvent, 100, FALSE) == WAIT_TIMEOUT) && !device->isLost()) {
+        }
     }
 
     // D3D12Buffer
@@ -2781,8 +2794,17 @@ namespace plume {
             range.End = readRange->end;
         }
 
+        // A buffer whose creation failed (its device removed) has no resource, and a removed device's Map() fails: both
+        // map to nullptr, as a lost device's buffers do under PLUME_LOSE_DEVICE_AFTER.
+        if ((d3d == nullptr) || device->lostTest.lost()) {
+            return nullptr;
+        }
+
         void *outputData = nullptr;
-        d3d->Map(subresource, (readRange != nullptr) ? &range : nullptr, &outputData);
+        if (FAILED(d3d->Map(subresource, (readRange != nullptr) ? &range : nullptr, &outputData))) {
+            return nullptr;
+        }
+
         return outputData;
     }
 
@@ -4162,6 +4184,41 @@ namespace plume {
 
     bool D3D12Device::isValid() const {
         return d3d != nullptr;
+    }
+
+    static const char *deviceRemovedReasonName(HRESULT reason) {
+        switch (reason) {
+        case DXGI_ERROR_DEVICE_HUNG:
+            return "DXGI_ERROR_DEVICE_HUNG";
+        case DXGI_ERROR_DEVICE_REMOVED:
+            return "DXGI_ERROR_DEVICE_REMOVED";
+        case DXGI_ERROR_DEVICE_RESET:
+            return "DXGI_ERROR_DEVICE_RESET";
+        case DXGI_ERROR_DRIVER_INTERNAL_ERROR:
+            return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
+        case DXGI_ERROR_INVALID_CALL:
+            return "DXGI_ERROR_INVALID_CALL";
+        case E_OUTOFMEMORY:
+            return "E_OUTOFMEMORY";
+        default:
+            return "unknown";
+        }
+    }
+
+    // Removed by a TDR (the GPU took too long), a driver's fault or update, or the GPU going away. The reason is logged
+    // once, so a player's log says what the driver said.
+    bool D3D12Device::isLost() const {
+        const HRESULT reason = d3d->GetDeviceRemovedReason();
+        if (reason != S_OK) {
+            if (!removalLogged.exchange(true)) {
+                fprintf(stderr, "D3D12: the device was removed: %s (0x%08lX).\n", deviceRemovedReasonName(reason), (unsigned long)(reason));
+            }
+
+            return true;
+        }
+
+        lostTest.arm();
+        return lostTest.lost();
     }
 
     bool D3D12Device::beginCapture() {

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "plume_render_interface.h"
+#include "plume_lost_device_test.h"
 
 #include <map>
 #include <mutex>
@@ -448,6 +449,8 @@ namespace plume {
         RenderDeviceDescription description;
         uint64_t timestampFrequency = 1;
         bool gpuUploadHeapFallback = false;
+        mutable std::atomic<bool> removalLogged = false;
+        LostDeviceTest lostTest;
 
         D3D12Device(D3D12Interface *renderInterface, const std::string &preferredDeviceName);
         ~D3D12Device() override;
@@ -477,6 +480,7 @@ namespace plume {
         bool isValid() const;
         bool beginCapture() override;
         bool endCapture() override;
+        bool isLost() const override;
     };
 
     struct D3D12Interface : RenderInterface {
