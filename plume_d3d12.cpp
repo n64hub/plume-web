@@ -1823,13 +1823,15 @@ namespace plume {
     }
 
     void D3D12QueryPool::queryResults() {
-        // No heap, or a readback buffer that maps to nothing (its device removed): the results are 0.
-        void *readbackData = (readbackBuffer != nullptr) ? readbackBuffer->map() : nullptr;
-        if (readbackData == nullptr) {
+        // No heap, a readback buffer that wasn't made, or one that maps to nothing, its device removed: the results are 0.
+        // Asked before the map, which game forks' plume checks after in their own ways.
+        const D3D12Buffer *interfaceReadbackBuffer = static_cast<const D3D12Buffer *>(readbackBuffer.get());
+        if ((interfaceReadbackBuffer == nullptr) || (interfaceReadbackBuffer->d3d == nullptr) || device->isLost()) {
             std::fill(results.begin(), results.end(), 0);
             return;
         }
 
+        void *readbackData = readbackBuffer->map();
         memcpy(results.data(), readbackData, sizeof(uint64_t) * results.size());
         readbackBuffer->unmap();
 
@@ -2343,6 +2345,10 @@ namespace plume {
     }
 
     void D3D12CommandList::copyTextureRegion(const RenderTextureCopyLocation &dstLocation, const RenderTextureCopyLocation &srcLocation, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) {
+        if ((toD3D12(dstLocation).pResource == nullptr) || (toD3D12(srcLocation).pResource == nullptr)) {
+            return;
+        }
+
         D3D12_BOX copyBox;
         if (srcBox != nullptr) {
             copyBox.left = srcBox->left;
@@ -2355,10 +2361,6 @@ namespace plume {
 
         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
-        if ((copyDstLocation.pResource == nullptr) || (copySrcLocation.pResource == nullptr)) {
-            return;
-        }
-
         setSamplePositions(dstLocation.texture);
         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
         resetSamplePositions();
