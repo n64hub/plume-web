@@ -343,7 +343,7 @@ namespace plume {
             // behind the page's thread). unmap() hands that memory to the device thread, which writes what was written
             // into the backend's buffer, so the caller can write the next data at once, before the device thread has got
             // to the last: waitForCommandFence() doesn't wait for it. The memory is made at each map and freed once the
-            // device thread has written it out. Kept, it was a copy of every upload buffer in the heap beside the
+            // device thread has written it out, or at unmap() for a write of half of it or less (unmap() says why). Kept, it was a copy of every upload buffer in the heap beside the
             // backend's, and those add up: RT64's 64 workloads each keep their buffers at the size of the largest draws
             // they have had (Rush 2049's page ran out of its heap in a race). So, as the backend's (plume_webgpu.h,
             // WebGPUBuffer::shadow), what it holds at map() is undefined, and a caller writes all it unmaps. Not one of
@@ -403,9 +403,27 @@ namespace plume {
                 setUploadMapped(this, false);
                 const uint64_t begin = ranged ? std::min(range.begin, size) : 0;
                 const uint64_t end = ranged ? std::min(std::max(range.end, begin), size) : size;
-                thread->runAsync([buffer, begin, end, written = std::move(uploadCopy), ranged, range]() {
+
+                // What was written goes to the device thread, not the whole buffer, when it is half of it or less: the
+                // copy waits in the queue until the device thread gets to it, and RT64 writes a few KB at a time into an
+                // upload buffer of 15.5 MB, at each of 39 unmaps queued while Mario Tennis' page's thread had fallen
+                // behind in Firefox at 3840x2000, which held 578 MB of the heap at once and ran it out. The buffer's own
+                // copy is freed here, so the next map() makes it again from the chunk just freed.
+                std::shared_ptr<uint8_t[]> written;
+                uint64_t writtenOffset = 0;
+                if ((end - begin) <= (size / 2)) {
+                    written.reset(new uint8_t[end - begin]);
+                    memcpy(written.get(), uploadCopy.get() + begin, end - begin);
+                    uploadCopy.reset();
+                    writtenOffset = begin;
+                }
+                else {
+                    written = std::move(uploadCopy);
+                }
+
+                thread->runAsync([buffer, begin, end, written = std::move(written), writtenOffset, ranged, range]() {
                     uint8_t *data = static_cast<uint8_t *>(buffer->map(0, nullptr));
-                    memcpy(data + begin, written.get() + begin, end - begin);
+                    memcpy(data + begin, written.get() + (begin - writtenOffset), end - begin);
                     buffer->unmap(0, ranged ? &range : nullptr);
                 });
             }
