@@ -1405,7 +1405,8 @@ namespace plume {
         const bool tearingAllowed = (swapChainFlags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0U;
         UINT syncInterval = (vsyncEnabled && !desc.enablePresentWait) ? 1 : 0;
         UINT flags = (!vsyncEnabled && tearingAllowed) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-        HRESULT res = d3d->Present(syncInterval, flags);
+        // Under PLUME_LOSE_DEVICE_AFTER a lost device's present fails as a removed device's does.
+        HRESULT res = commandQueue->device->lostTest.lost() ? DXGI_ERROR_DEVICE_REMOVED : d3d->Present(syncInterval, flags);
         if (FAILED(res)) {
             // Logs a removal's reason, once.
             commandQueue->device->isLost();
@@ -1425,6 +1426,11 @@ namespace plume {
     }
 
     bool D3D12SwapChain::resize() {
+        // A swap chain whose creation failed has nothing to resize.
+        if (d3d == nullptr) {
+            return false;
+        }
+
         getWindowSize(width, height);
 
         // Don't resize the swap chain at all if the window doesn't have a valid size.
@@ -1432,12 +1438,17 @@ namespace plume {
             return false;
         }
 
+        // A resize that failed (its device removed: a failed present makes the present thread resize) left no buffers,
+        // and the thread asks again each frame until the device is replaced, so there may be none to release.
         for (uint32_t i = 0; i < desc.textureCount; i++) {
-            textures[i].d3d->Release();
-            textures[i].d3d = nullptr;
+            if (textures[i].d3d != nullptr) {
+                textures[i].d3d->Release();
+                textures[i].d3d = nullptr;
+            }
         }
 
-        HRESULT res = d3d->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, swapChainFlags);
+        // Under PLUME_LOSE_DEVICE_AFTER a lost device's resize fails as a removed device's does.
+        HRESULT res = commandQueue->device->lostTest.lost() ? DXGI_ERROR_DEVICE_REMOVED : d3d->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, swapChainFlags);
         if (FAILED(res)) {
             fprintf(stderr, "ResizeBuffers failed with error code 0x%lX.\n", res);
             return false;

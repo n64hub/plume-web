@@ -17,8 +17,9 @@ namespace plume {
     // is lost, which can't be made to happen on a GPU at will (a forced TDR resets the GPU under every other program on
     // it). The first device of the process that is asked isLost() says so from that many seconds after it was first
     // asked, and its buffers map() to nullptr, as a removed D3D12 device's do. On D3D12 its buffers, textures and query
-    // heaps made from then on fail to be made, with DXGI_ERROR_DEVICE_REMOVED, as a removed device's do, so what uses
-    // one is tested too (a Vulkan device lost for real still makes them). The device itself goes on working otherwise,
+    // heaps made from then on fail to be made, and its swap chain's presents and resizes fail, with
+    // DXGI_ERROR_DEVICE_REMOVED, as a removed device's do, so what uses one is tested too (a Vulkan device lost for real
+    // still makes them). The device itself goes on working otherwise,
     // and a device made after it, to carry on with, is never lost this way.
     struct LostDeviceTest {
         // Nanoseconds of the steady clock at which the device is lost; 0 while it isn't the device being tested.
