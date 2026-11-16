@@ -4042,6 +4042,17 @@ namespace plume {
         depthTargetHeapAllocator.reset();
         rtDummyGlobalPipelineLayout.reset();
         rtDummyLocalPipelineLayout.reset();
+        // The allocator holds references to the device and the adapter: kept, it kept the device alive past its end, and
+        // D3D12CreateDevice gives back an adapter's device while anything holds it, so a device removed by a TDR came
+        // back removed to the replacement asked of the adapter, which was passed over (a Windows player's Rush 2049 fell
+        // back to Vulkan after each one). Its pool goes first, as D3D12MA asks. It is made after release()'s only other
+        // call, so it goes here, clear of the lines Pokemon Snap's own plume adds to release().
+        customUploadPool.reset();
+        if (allocator != nullptr) {
+            allocator->Release();
+            allocator = nullptr;
+        }
+
         release();
     }
 
@@ -4301,16 +4312,6 @@ namespace plume {
     }
 
     void D3D12Device::release() {
-        // The allocator holds references to the device and the adapter: kept, it kept the device alive past its end, and
-        // D3D12CreateDevice gives back an adapter's device while anything holds it, so a device removed by a TDR came
-        // back removed to the replacement asked of the adapter, which was passed over (a Windows player's Rush 2049 fell
-        // back to Vulkan after each one). Its pool goes first, as D3D12MA asks.
-        customUploadPool.reset();
-        if (allocator != nullptr) {
-            allocator->Release();
-            allocator = nullptr;
-        }
-
         if (d3d != nullptr) {
             const ULONG referencesLeft = d3d->Release();
             if (referencesLeft != 0) {
