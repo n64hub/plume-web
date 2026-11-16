@@ -2372,17 +2372,9 @@ namespace plume {
 
         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
-
-        // A placed footprint (a texture read back into a buffer) has no texture, so no sample positions to set.
-        const bool dstTexture = (dstLocation.type == RenderTextureCopyType::SUBRESOURCE);
-        if (dstTexture) {
-            setSamplePositions(dstLocation.texture);
-        }
-
+        setSamplePositions(dstLocation.texture);
         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
-        if (dstTexture) {
-            resetSamplePositions();
-        }
+        resetSamplePositions();
     }
 
     void D3D12CommandList::copyBuffer(const RenderBuffer *dstBuffer, const RenderBuffer *srcBuffer) {
@@ -2579,7 +2571,11 @@ namespace plume {
     }
     
     void D3D12CommandList::setSamplePositions(const RenderTexture *texture) {
-        assert(texture != nullptr);
+        // copyTextureRegion() into a buffer's placed footprint (a texture read back) has no destination texture.
+        if (texture == nullptr) {
+            resetSamplePositions();
+            return;
+        }
 
         const D3D12Texture *interfaceTexture = static_cast<const D3D12Texture *>(texture);
         if (interfaceTexture->desc.multisampling.sampleLocationsEnabled) {
