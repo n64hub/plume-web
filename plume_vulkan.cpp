@@ -3233,6 +3233,31 @@ namespace plume {
         const VulkanTexture *srcTexture = static_cast<const VulkanTexture *>(srcLocation.texture);
         const VulkanBuffer *dstBuffer = static_cast<const VulkanBuffer *>(dstLocation.buffer);
         const VulkanBuffer *srcBuffer = static_cast<const VulkanBuffer *>(srcLocation.buffer);
+        if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
+            // A texture read back into a buffer, as D3D12's CopyTextureRegion does it. First and on its own, so a port
+            // whose own plume has this branch further down keeps its lines as they are.
+            assert(srcTexture != nullptr);
+            assert(dstBuffer != nullptr);
+
+            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
+            VkBufferImageCopy imageCopy = {};
+            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
+            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
+            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
+            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
+            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
+            imageCopy.imageSubresource.layerCount = 1;
+            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
+            imageCopy.imageOffset.x = (srcBox != nullptr) ? srcBox->left : 0;
+            imageCopy.imageOffset.y = (srcBox != nullptr) ? srcBox->top : 0;
+            imageCopy.imageOffset.z = (srcBox != nullptr) ? srcBox->front : 0;
+            imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
+            imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
+            imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
+            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
+            return;
+        }
+
         if ((dstLocation.type == RenderTextureCopyType::SUBRESOURCE) && (srcLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT)) {
             assert(dstTexture != nullptr);
             assert(srcBuffer != nullptr);
@@ -3253,28 +3278,6 @@ namespace plume {
             imageCopy.imageExtent.height = srcLocation.placedFootprint.height;
             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
-        }
-        else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
-            // A texture read back into a buffer, as D3D12's CopyTextureRegion does it.
-            assert(srcTexture != nullptr);
-            assert(dstBuffer != nullptr);
-
-            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
-            VkBufferImageCopy imageCopy = {};
-            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
-            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
-            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
-            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
-            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
-            imageCopy.imageSubresource.layerCount = 1;
-            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
-            imageCopy.imageOffset.x = (srcBox != nullptr) ? srcBox->left : 0;
-            imageCopy.imageOffset.y = (srcBox != nullptr) ? srcBox->top : 0;
-            imageCopy.imageOffset.z = (srcBox != nullptr) ? srcBox->front : 0;
-            imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
-            imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
-            imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
-            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
         }
         else {
             VkImageCopy imageCopy = {};
