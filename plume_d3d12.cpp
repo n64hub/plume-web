@@ -2372,9 +2372,17 @@ namespace plume {
 
         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
-        setSamplePositions(dstLocation.texture);
+
+        // A placed footprint (a texture read back into a buffer) has no texture, so no sample positions to set.
+        const bool dstTexture = (dstLocation.type == RenderTextureCopyType::SUBRESOURCE);
+        if (dstTexture) {
+            setSamplePositions(dstLocation.texture);
+        }
+
         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
-        resetSamplePositions();
+        if (dstTexture) {
+            resetSamplePositions();
+        }
     }
 
     void D3D12CommandList::copyBuffer(const RenderBuffer *dstBuffer, const RenderBuffer *srcBuffer) {
