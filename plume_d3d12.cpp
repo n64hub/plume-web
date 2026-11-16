@@ -4038,6 +4038,8 @@ namespace plume {
     D3D12Device::~D3D12Device() {
         viewHeapAllocator.reset();
         samplerHeapAllocator.reset();
+        colorTargetHeapAllocator.reset();
+        depthTargetHeapAllocator.reset();
         rtDummyGlobalPipelineLayout.reset();
         rtDummyLocalPipelineLayout.reset();
         release();
