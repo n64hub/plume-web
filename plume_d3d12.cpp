@@ -1906,6 +1906,22 @@ namespace plume {
     }
 
     D3D12CommandList::~D3D12CommandList() {
+        // Each interface the list was queried for holds a reference to it, and the list holds its device: kept, every
+        // command list kept its device alive past its end (see D3D12Device::release()).
+        if (d3dV1 != nullptr) {
+            d3dV1->Release();
+        }
+
+        if (d3dV4 != nullptr) {
+            d3dV4->Release();
+        }
+
+#   ifdef PLUME_D3D12_AGILITY_SDK_ENABLED
+        if (d3dV9 != nullptr) {
+            d3dV9->Release();
+        }
+#   endif
+
         if (d3d != nullptr) {
             d3d->Release();
         }
@@ -4283,8 +4299,22 @@ namespace plume {
     }
 
     void D3D12Device::release() {
+        // The allocator holds references to the device and the adapter: kept, it kept the device alive past its end, and
+        // D3D12CreateDevice gives back an adapter's device while anything holds it, so a device removed by a TDR came
+        // back removed to the replacement asked of the adapter, which was passed over (a Windows player's Rush 2049 fell
+        // back to Vulkan after each one). Its pool goes first, as D3D12MA asks.
+        customUploadPool.reset();
+        if (allocator != nullptr) {
+            allocator->Release();
+            allocator = nullptr;
+        }
+
         if (d3d != nullptr) {
-            d3d->Release();
+            const ULONG referencesLeft = d3d->Release();
+            if (referencesLeft != 0) {
+                fprintf(stderr, "D3D12: the device ended with %lu references left: something made on it is still alive.\n", (unsigned long)(referencesLeft));
+            }
+
             d3d = nullptr;
         }
 
