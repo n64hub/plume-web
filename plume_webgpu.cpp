@@ -549,18 +549,52 @@ namespace plume {
         }
     }
 
-    // Called after a submission that copied into this buffer.
-    void WebGPUBuffer::requestReadback() {
-        assert((readback != nullptr) && !readback->pending);
-
-        readback->serial++;
-        readback->pending = true;
+    static void mapReadback(const std::shared_ptr<WebGPUReadback> &readback) {
+        WebGPUBuffer *buffer = readback->buffer;
         WGPUBufferMapCallbackInfo callbackInfo = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
         callbackInfo.callback = readbackMapped;
         callbackInfo.userdata1 = new std::shared_ptr<WebGPUReadback>(readback);
         callbackInfo.userdata2 = reinterpret_cast<void *>(uintptr_t(readback->serial));
-        wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, size, callbackInfo);
+        wgpuBufferMapAsync(buffer->buffer, WGPUMapMode_Read, 0, buffer->size, callbackInfo);
+    }
+
+    // A map put off by requestReadback(), in a task of its own: by then the cancelled map's rejection has run.
+    static void deferredMap(void *userdata) {
+        std::shared_ptr<WebGPUReadback> *pointer = static_cast<std::shared_ptr<WebGPUReadback> *>(userdata);
+        std::shared_ptr<WebGPUReadback> readback = std::move(*pointer);
+        delete pointer;
+
+        readback->mapDeferred = false;
+        readback->unmapSettling = false;
+        if ((readback->buffer != nullptr) && readback->pending) {
+            mapReadback(readback);
+        }
+    }
+
+    // Called after a submission that copied into this buffer.
+    //
+    // After cancelReadback() unmapped a map in flight, the next map waits for a task of its own. emdawnwebgpu answers
+    // the cancelled map at once, but the browser rejects its mapAsync() promise only once the current task is done,
+    // and that rejection forgets whatever map the buffer has then (it deletes the buffer's entry in its list of what
+    // to free at unmap, not the cancelled map's). A map made in the same task lost that entry: reading it threw a
+    // TypeError in emwgpuBufferGetConstMappedRange, and its unmap, finding no entry, took the buffer for unmapped and
+    // left it mapped, so every later submission that copied into it failed ("used in submit while mapped") and every
+    // later map with it ("already mapped"). Only a build that can't wait for a map cancels one (waitForReadback()).
+    void WebGPUBuffer::requestReadback() {
+        assert((readback != nullptr) && !readback->pending);
+
+        readback->serial++;
+        readback->pending = true;
+        if (readback->unmapSettling) {
+            if (!readback->mapDeferred) {
+                readback->mapDeferred = true;
+                emscripten_async_call(deferredMap, new std::shared_ptr<WebGPUReadback>(readback), 0);
+            }
+        }
+        else {
+            mapReadback(readback);
+        }
     }
 
     // Waits for the map in flight, if the build can wait. Called before reading the buffer and before a submission
@@ -578,7 +612,7 @@ namespace plume {
             }
         }
         else {
-            PLUME_WEBGPU_UNSUPPORTED("a READBACK buffer was mapped before its data arrived and this build can't wait for it (no ASYNCIFY or JSPI, or threads without plume_device_thread.h): it reads what arrived before the call");
+            PLUME_WEBGPU_UNSUPPORTED("a READBACK buffer was mapped or copied into again before its data arrived and this build can't wait for it (no ASYNCIFY or JSPI, or threads): a map reads what arrived before the call, and a copy drops the data in flight");
         }
     }
 
@@ -593,7 +627,12 @@ namespace plume {
 
     void WebGPUBuffer::cancelReadback() {
         if (readback->pending) {
-            wgpuBufferUnmap(buffer);
+            // A map still deferred hasn't been made, so there is nothing to unmap.
+            if (!readback->mapDeferred) {
+                wgpuBufferUnmap(buffer);
+                readback->unmapSettling = true;
+            }
+
             readback->pending = false;
             readback->serial++;
         }

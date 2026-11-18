@@ -44,7 +44,8 @@
 //   calling thread polls isMapReady() while the device thread is back in its event loop, where the callback runs.
 //   Without threads, map() waits for it itself when the build can (ASYNCIFY or JSPI: emscripten_sleep() hands the
 //   thread back to its event loop). Either way execute, wait, map reads what the GPU wrote, as on the other backends.
-//   A build that can't wait gets whatever arrived before the call, possibly a submission old. Firefox looks for
+//   A build that can't wait gets whatever arrived before the call, possibly a submission old, and a copy submitted
+//   into a buffer whose last map is still in flight cancels that map, so its data never arrives and the next map's does. Firefox looks for
 //   finished work only after a submission or every 100 ms, so while a map waits, or a present is in flight (below), an
 //   empty submission at most once a millisecond makes it look again (WebGPUDevice::pollQueue()).
 // - Formatted buffer views (texel buffers) don't exist. A formatted view binds its buffer as a read-only storage
@@ -174,6 +175,10 @@ namespace plume {
         WebGPUBuffer *buffer = nullptr;
         uint64_t serial = 0;
         bool pending = false;
+        // A map in flight was cancelled (unmapped) and the next one waits for a task of its own (deferredMap): see
+        // WebGPUBuffer::requestReadback().
+        bool unmapSettling = false;
+        bool mapDeferred = false;
     };
 
     struct WebGPUBuffer : RenderBuffer {
